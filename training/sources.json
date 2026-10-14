@@ -1,0 +1,38 @@
+{
+  "vivos": {
+    "name": "VIVOS Vietnamese Speech Corpus",
+    "language": "vi",
+    "original": "https://zenodo.org/records/7068130",
+    "mirror": "https://www.kaggle.com/datasets/kynthesis/vivos-vietnamese-speech-corpus-for-asr",
+    "license": "CC BY-NC-SA 4.0 (original Zenodo record; Kaggle metadata differs)",
+    "use": "Local, noncommercial research and evaluation; attribution and ShareAlike apply",
+    "speaker_identity": "VIVOS train/waves/<speaker_id>; do not merge speakers"
+  },
+  "libritts": {
+    "name": "LibriTTS dev-clean",
+    "language": "en",
+    "original": "https://www.openslr.org/60/",
+    "mirror": "https://www.openslr.org/resources/60/dev-clean.tar.gz",
+    "license": "CC BY 4.0",
+    "use": "Training and evaluation with attribution to LibriTTS and source recordings",
+    "speaker_identity": "LibriTTS/dev-clean/<speaker_id>; do not merge speakers"
+  },
+  "ljspeech": {
+    "name": "LJ Speech 1.1",
+    "language": "en",
+    "original": "https://keithito.com/LJ-Speech-Dataset/",
+    "mirror": "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2",
+    "license": "Public domain in the US; verify local jurisdiction",
+    "use": "Single-speaker English TTS training and held-out evaluation",
+    "speaker_identity": "Linda Johnson, speaker LJ; keep separate from all other speakers"
+  },
+  "emov": {
+    "name": "EmoV-DB Jenie Amused",
+    "language": "en",
+    "original": "https://github.com/numediart/EmoV-DB",
+    "mirror": "https://openslr.org/115/",
+    "license": "Non-commercial research, teaching and personal experimentation only",
+    "use": "Local noncommercial research and evaluation; commercial permission requires contacting the dataset owner",
+    "speaker_identity": "Jenie speaker, Amused style only; transcript from CMU Arctic a-series"
+  }
+}

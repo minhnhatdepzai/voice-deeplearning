@@ -1,0 +1,14 @@
+.venv/
+node_modules/
+dist/
+data/
+__pycache__/
+.pytest_cache/
+kaggle.json
+.env
+.env.*
+!.env.example
+release_assets/
+training/compare_clean.py
+*.log
+.DS_Store
