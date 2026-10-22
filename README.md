@@ -38,6 +38,7 @@ phần model và training.
 
 ## Mục lục
 
+- [Gói ngữ cảnh đầy đủ dành cho AI](#gói-ngữ-cảnh-đầy-đủ-dành-cho-ai)
 - [Kiến trúc và luồng xử lý](#kiến-trúc-và-luồng-xử-lý)
 - [Luồng từng chức năng](#luồng-từng-chức-năng)
 - [Frontend, backend và API](#frontend-backend-và-api)
@@ -52,6 +53,629 @@ phần model và training.
 - [Cấu trúc mã nguồn](#cấu-trúc-mã-nguồn)
 - [Thuật ngữ cần biết](#thuật-ngữ-cần-biết)
 - [Phụ lục kiến thức chuyên sâu](#phụ-lục-kiến-thức-chuyên-sâu)
+
+## Gói ngữ cảnh đầy đủ dành cho AI
+
+Phần này là bản mô tả máy có thể đọc để một AI mở **một URL README trên GitHub** vẫn hiểu đủ hệ thống trước khi
+đề xuất code. Nó mô tả code đang tồn tại tại commit chứa README, không thay thế việc đọc diff khi thực sự sửa file.
+
+### Cách dùng link repository với AI
+
+Có thể gửi AI câu lệnh ngắn sau:
+
+```text
+Đọc toàn bộ README của repository này trước: https://github.com/minhnhatdepzai/voice-deeplearning
+Hãy coi mục “Gói ngữ cảnh đầy đủ dành cho AI” là source of truth về kiến trúc.
+Phân biệt rõ: đã triển khai, đã kiểm thử, đã đo cục bộ, tùy chọn và chưa có.
+Trước khi đề xuất sửa, nêu luồng hiện tại, file bị ảnh hưởng, data migration, test cần chạy và giới hạn GPU/audio.
+Không giả định dự án có database, RAG, authentication, diarization tổng quát hoặc direct voice conversion.
+Yêu cầu của tôi: <ghi yêu cầu ở đây>.
+```
+
+Nếu AI có thể mở thêm file GitHub, thứ tự nên đọc là `README.md` → `docs/ARCHITECTURE.md` → file trong bảng
+“bản đồ thay đổi” → test tương ứng. Không cần tải raw audio, dataset, checkpoint hoặc `data/` để hiểu kiến trúc.
+
+### Danh tính kỹ thuật của hệ thống
+
+| Thuộc tính | Giá trị hiện tại |
+| --- | --- |
+| Tên sản phẩm | Vocalab · AI Voice Studio local |
+| Kiểu ứng dụng | Single-user local web application |
+| Frontend | React 19, React DOM 19, Vite 6, JavaScript JSX |
+| Backend | Python 3.12 trong container, FastAPI, Uvicorn một worker |
+| Xử lý media | FFmpeg/ffprobe; `rubberband` cho pitch/tempo khi có |
+| STT | faster-whisper `small` hoặc `turbo` |
+| TTS chính | VieNeu-TTS v3 Turbo; reference voice hoặc merged LoRA |
+| TTS tùy chọn | VoxCPM2 cho clone tham chiếu |
+| Tách audio | Demucs cho vocal/nhạc; ClearVoice cho hai speaker và denoise |
+| Fine-tuning | LoRA theo từng speaker bằng recipe VieNeu upstream |
+| Lưu trữ | Filesystem trong `data/`; JSON, JSONL, CSV, WAV và checkpoint |
+| Job queue | `ThreadPoolExecutor(max_workers=1)` và trạng thái trên đĩa |
+| GPU coordination | Cross-process `fcntl.flock` tại `data/auto_train/worker.lock` |
+| Container | Multi-stage Node 22 + Python 3.12; NVIDIA runtime; named volume |
+| CI | Python compile/test, shell syntax, Vite build, Compose config |
+| CD | Tag `v*` build và push image lên GHCR |
+| License code | MIT; không tự áp dụng cho dataset, checkpoint hoặc giọng nói |
+
+Các phiên bản runtime khóa trong `requirements.lock` tại thời điểm viết gồm FastAPI 0.159.1, faster-whisper 1.2.1,
+Pydantic 2.14.1, ONNX Runtime 1.23.2, NumPy 2.5.4, SciPy 1.18.1, SoundFile 0.14.0 và Uvicorn 0.54.0. Phạm vi khai
+báo hỗ trợ nằm trong `requirements.txt`; lockfile mới là đầu vào tái tạo container/CI.
+
+### Mười hai bất biến không được phá khi sửa code
+
+1. `data/` chứa dữ liệu riêng tư và artifact lớn, không được commit vào Git hoặc bake vào public image.
+2. Mỗi voice ID và job ID là UUID hex 32 ký tự; đường dẫn nhận ID phải validate trước khi nối filesystem.
+3. Upload chỉ nhận phần mở rộng trong allowlist và mặc định tối đa 500 MB; file rỗng bị từ chối.
+4. File thư viện hoặc training dài tối đa 3.600 giây; guided clip phải dài 3–15 giây.
+5. Người dùng phải xác nhận quyền sử dụng giọng trước khi tạo voice, thêm training file hoặc tách giọng mục tiêu.
+6. Một GPU lock dùng chung giữa training và inference nặng; không tạo đường chạy mới bỏ qua lock.
+7. Speech jobs giữ input cho tới khi hoàn tất hoặc lỗi để có thể requeue sau API restart.
+8. Docker/Uvicorn chạy một worker cho tới khi queue và lock chuyển sang dịch vụ dùng chung.
+9. Adapter upload cũ không bị thay nếu dữ liệu thiếu, precheck xấu, train lỗi hoặc cold reload lỗi.
+10. Dataset đã duyệt có hash; sửa transcript hoặc include flag phải làm mất hiệu lực precheck cũ.
+11. Fine-tuned voice chỉ được nạp khi run có trạng thái `evaluated` hoặc `full_trained` và merged model tồn tại.
+12. Health HTTP không được dùng làm bằng chứng inference hoặc chất lượng giọng; phải sinh và kiểm tra WAV thật.
+
+### Những thứ không tồn tại trong code hiện tại
+
+| Khái niệm dễ bị AI đoán nhầm | Sự thật trong repository |
+| --- | --- |
+| PostgreSQL, MongoDB hoặc SQLite | Không có; metadata nằm trên filesystem |
+| Redis, Celery, Kafka hoặc RabbitMQ | Không có; queue nằm trong process |
+| RAG hoặc vector database tài liệu | Không có; speaker embedding chỉ biểu diễn âm sắc |
+| OAuth, JWT, session đăng nhập, RBAC | Không có; app chỉ nên bind localhost |
+| Multi-tenant | Không có; file và voice không có owner account |
+| Kubernetes hoặc Helm | Không có; deployment hiện dùng Docker Compose |
+| Direct streaming voice conversion | Không có; speech-to-speech bắt đầu sau khi bấm dừng và chạy ASR→TTS |
+| Diarization tổng quát N người | Không có; clustering chọn giọng và model separation tối đa hai stem |
+| Emotion model/style token đã train | Không có; preset biểu cảm là hậu xử lý prosody |
+| Training base model từ đầu | Không có; chỉ fine-tune LoRA VieNeu theo speaker |
+| Production MOS/ABX | Chưa có; metric hiện tại chủ yếu là proxy và benchmark cục bộ |
+
+### Tiến trình khởi động
+
+```mermaid
+flowchart TD
+  A["Người dùng chạy run.sh"] --> B["Tạo .venv nếu thiếu"]
+  B --> C["Cài requirements.lock"]
+  C --> D{"node_modules đã có?"}
+  D -->|"Không"| E["npm install"]
+  D -->|"Có"| F["npm run build"]
+  E --> F
+  F --> G["Uvicorn 127.0.0.1:8000"]
+  H["Docker entrypoint"] --> I{"Bootstrap mode auto?"}
+  I -->|"Có"| J["Cài pinned VieNeu và ClearVoice nếu thiếu"]
+  I -->|"Không"| K["Bỏ qua model bootstrap"]
+  J --> L["Uvicorn 0.0.0.0:8000, một worker"]
+  K --> L
+  G --> M["FastAPI lifespan"]
+  L --> M
+  M --> N["Đánh dấu training bị container ngắt"]
+  N --> O["Requeue speech jobs còn input"]
+  O --> P["Serve API và dist/"]
+```
+
+`run.sh` chỉ cài app dependency và build UI; môi trường training VieNeu/ClearVoice được cài bằng `training/setup.sh`
+và `training/setup_voice_filter.sh`. Docker entrypoint có thể bootstrap hai môi trường đó trong volume ở lần đầu.
+
+### Biến môi trường và cấu hình chạy
+
+| Biến | Mặc định | Được đọc ở đâu | Tác dụng |
+| --- | --- | --- | --- |
+| `VOCALAB_PORT` | `8000` | `compose.yaml` | Port host, vẫn bind `127.0.0.1` |
+| `VOICE_STUDIO_BOOTSTRAP_MODE` | `auto` | Docker entrypoint | `auto` cài upstream; `skip` chỉ bỏ bootstrap |
+| `VOICE_STUDIO_DATA` | `<repo>/data` | `server/app.py` | Đổi root filesystem runtime |
+| `VOICE_STUDIO_WORKER_MODE` | desktop systemd | API/Compose | `subprocess` trong container; desktop dùng `systemd-run --user` |
+| `WHISPER_MODEL` | `small` | STT file thông thường | Override model STT ngoài profile tương tác |
+| `VIENEU_UPSTREAM` | `data/upstream/vieneu` | train/API | Đổi checkout VieNeu upstream |
+| `HF_HOME` | theo hệ thống; Compose `/app/data/huggingface` | Hugging Face | Đặt model cache trong volume |
+| `NVIDIA_VISIBLE_DEVICES` | `all` trong image | NVIDIA runtime | GPU nhìn thấy trong container |
+| `NVIDIA_DRIVER_CAPABILITIES` | `compute,utility` | NVIDIA runtime | Capability cần cho CUDA và `nvidia-smi` |
+
+`VOICE_STUDIO_BOOTSTRAP_MODE=skip` không làm inference tự hoạt động. Nó chỉ giúp smoke test API khi upstream model
+chưa được cài. Không đưa secret vào image hoặc commit `.env`.
+
+### Hợp đồng API đầy đủ ở mức kiến trúc
+
+Mọi route dùng prefix `/api`. JSON lỗi theo chuẩn FastAPI có trường `detail`. Route upload dùng
+`multipart/form-data`; route có Pydantic model dùng JSON. File media chỉ được trả qua route kiểm soát, không mount
+toàn bộ `data/` thành static directory.
+
+#### Health và guided self-training
+
+| Method và path | Input | Output hoặc hành vi chính |
+| --- | --- | --- |
+| `GET /health` | Không | `ok`, trạng thái TTS worker, STT warm/device và FFmpeg |
+| `GET /self-training/sessions` | Không | Danh sách session mới nhất trước |
+| `POST /self-training/sessions` | JSON `{name, locale, consent}` | Tạo session 80 prompts; `locale` là `vi-VN` hoặc `en-US` |
+| `GET /self-training/sessions/{id}` | Session ID | State cùng `accepted_count`, `accepted_seconds`, `ready_to_train` |
+| `POST /self-training/sessions/{id}/clips/{index}` | Form file | Decode 24 kHz, kiểm tra 3–15 giây, ASR và so với prompt |
+| `POST /self-training/sessions/{id}/clips/{index}/accept` | Không | Người dùng xác nhận clip ASR chưa tự đạt |
+| `GET /self-training/sessions/{id}/clips/{index}/audio` | Không | WAV clip đã thu |
+| `POST /self-training/sessions/{id}/train` | Không | Prepare dataset và dispatch `training.self_train` |
+
+Guided session cần tối thiểu 50 clip đã chấp nhận và 300 giây. Clip tự đạt khi có transcript và similarity chữ
+không dấu từ `SequenceMatcher` ít nhất 0,65. WAV sau decode phải mono, PCM 16-bit, 24 kHz; RMS dưới 0,006 hoặc tỷ lệ
+clipping trên 2% bị từ chối.
+
+#### Corpus training và model registry
+
+| Method và path | Input | Output hoặc hành vi chính |
+| --- | --- | --- |
+| `GET /training/sources` | Không | Nguồn, license, trainable và archive đã tải chưa |
+| `GET /training/benchmarks` | Không | Benchmark FPT đã có trên đĩa |
+| `GET /training/speakers/{source}` | Source ID | Speaker và số clip trong archive |
+| `GET /training/datasets` | Không | Prepared manifests |
+| `POST /training/prepare` | JSON `{source, speaker, max_clips}` | Job chuẩn bị dataset |
+| `POST /training/train` | JSON `{dataset, steps}` | Job chạy LoRA |
+| `GET /training/jobs` | Không | Job prepare/train/evaluate trong bộ nhớ process |
+| `POST /training/evaluate` | JSON `{run, count}` | Sinh và chấm tối đa 30 test items |
+| `POST /training/benchmark/fpt` | Không | Chạy STT benchmark FPT |
+| `POST /training/register` | JSON `{run}` | Thêm run `evaluated` hoặc `full_trained` vào voice library |
+| `GET /training/runs` | Không | Trạng thái, updates, hash, metrics và registration |
+| `GET /training/queue` | Không | Trạng thái auto/extended training nếu có |
+
+Validation JSON:
+
+```json
+{
+  "prepare": {
+    "source": "vivos",
+    "speaker": "VIVOSSPK13",
+    "max_clips": 300
+  },
+  "train": {
+    "dataset": "vivos_VIVOSSPK13",
+    "steps": 90
+  },
+  "evaluate": {
+    "run": "my_vivos_spk13",
+    "count": 20
+  },
+  "register": {
+    "run": "my_vivos_spk13"
+  }
+}
+```
+
+`speaker` chỉ nhận chữ, số, `_`, `-`, tối đa 80 ký tự. `max_clips` nằm trong 30–10.000; `steps` trong 1–10.000;
+`count` trong 1–30. Tên dataset/run được giới hạn bằng regex để tránh path traversal.
+
+#### Voice library, separation và TTS
+
+| Method và path | Form/query quan trọng | Output hoặc hành vi chính |
+| --- | --- | --- |
+| `GET /voices` | Không | Voice reference và fine-tuned voice trong `voices.json` |
+| `POST /voices` | `file`, `name`, `start`, `consent`, `locale`, `speaker_mode` | Lưu nguồn và tạo reference WAV |
+| `DELETE /voices/{id}` | query `purge_derived` | Xóa voice; tùy chọn xóa derivative hợp lệ |
+| `POST /voices/{id}/training-files` | `file`, `consent` | Thêm bản thu cùng speaker; chặn file trùng hash |
+| `GET /voices/{id}/training` | Không | Trạng thái upload worker và run stage nếu có |
+| `POST /voices/{id}/refresh-reference` | query `clean` | Chọn/tạo lại mẫu tham chiếu |
+| `POST /voices/{id}/train-full` | query `clean` | Dispatch upload training worker |
+| `GET /voices/{id}/training-review` | `offset`, `limit` | Trang candidate clips; mặc định 25 |
+| `GET /voices/{id}/training-review/{filename}` | Filename dạng `000001.wav` | Audio candidate để nghe |
+| `PUT /voices/{id}/training-review/{filename}` | JSON `{text, include}` | Sửa transcript hoặc loại clip |
+| `POST /voices/{id}/training-review/approve` | Không | Ghi train files/hash và tiếp tục worker |
+| `GET /voices/{id}/source` | Không | Stream file nguồn với media type được phát hiện |
+| `POST /separate` | `file` | Demucs vocal/accompaniment |
+| `POST /target-voice` | `file`, `voice_id` hoặc `reference`, `mode`, `enhance`, `consent`, `auto_dominant`, `locale` | WAV mục tiêu, residual và MP4 nếu nguồn là video |
+| `POST /tts` | `voice_id`, `text`, `delivery`, `video/source`, `source_mode`, `engine`, `locale` | WAV hoặc media đã phối |
+
+`POST /voices` có hai cách chọn reference: `speaker_mode=manual` dùng điểm `start`; chế độ dominant phân tích vùng
+lời rồi chọn cụm nhiều thời lượng nhất. `start` không có nghĩa pipeline fine-tune chỉ đọc từ vị trí đó. Text TTS
+phải dài 1–5.000 ký tự.
+
+#### Speech-to-speech, STT và editor
+
+| Method và path | Input | Output hoặc hành vi chính |
+| --- | --- | --- |
+| `POST /speech-to-speech/warmup` | JSON `{voice_id, quality, language}` | Load STT/TTS và trả thời gian warmup |
+| `POST /speech-to-speech/release` | Không | Dừng warm VieNeu subprocess |
+| `POST /speech-to-speech` | Form file + các profile | Xử lý đồng bộ, chủ yếu dùng benchmark/compatibility |
+| `POST /speech-to-speech/jobs` | Form file + các profile | Trả HTTP 202 và state job ngay |
+| `GET /speech-to-speech/jobs/{id}` | Job ID | State, progress, result hoặc error |
+| `DELETE /speech-to-speech/jobs/{id}` | Job đã xong/lỗi | Xóa status/input/output; job đang chạy trả 409 |
+| `POST /stt` | `file`, `language=auto|vi|en` | Transcript, segments và SRT/TXT URL |
+| `GET /media/{kind}/{filename}` | Kind/filename allowlisted | Stream output đã tạo |
+| `POST /editor/export` | `files[]`, JSON `timeline`, optional `overlay` | Render WAV nếu chỉ audio, MP4 nếu có video |
+
+Speech profile là enum đóng, không nhận giá trị tùy ý:
+
+| Nhóm | Tên | Tham số thật |
+| --- | --- | --- |
+| ASR | `fast` | Whisper `small`, beam 1 |
+| ASR | `balanced` | Whisper `turbo`, beam 3 |
+| ASR | `accurate` | Whisper `turbo`, beam 5 |
+| TTS | `natural` | temperature 0,8; top-k 25; top-p 0,95; repetition penalty 1,2 |
+| TTS | `clear` | temperature 0,55; top-k 20; top-p 0,9; repetition penalty 1,2 |
+| TTS | `stable` | temperature 0,35; top-k 15; top-p 0,85; repetition penalty 1,2 |
+| Output filter | `off` | Không thêm filter |
+| Output filter | `light` | high-pass 55 Hz + `afftdn` nhẹ |
+| Output filter | `strong` | high-pass 70 Hz + `afftdn` mạnh hơn |
+
+Ví dụ tạo và poll speech job:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/speech-to-speech/jobs \
+  -F 'file=@recording.webm' \
+  -F 'voice_id=0123456789abcdef0123456789abcdef' \
+  -F 'language=vi' \
+  -F 'quality=balanced' \
+  -F 'tts_profile=stable' \
+  -F 'denoise=light'
+
+curl -sS http://127.0.0.1:8000/api/speech-to-speech/jobs/JOB_ID
+```
+
+Khi hoàn tất, `result` có transcript, ngôn ngữ phát hiện, voice ID/name, `audio_url`, thời lượng input, model/device
+STT, số TTS chunks, warm flags và latency tách theo decode/STT/TTS/total.
+
+### State machine: speech job
+
+```mermaid
+stateDiagram-v2
+  [*] --> queued: POST jobs và lưu input
+  queued --> running: executor nhận job
+  running --> running: decoding
+  running --> running: transcribing
+  running --> running: synthesizing n trên total
+  running --> complete: lưu result và xóa input
+  queued --> failed: input bị mất
+  running --> failed: decode, ASR, TTS hoặc media lỗi
+  complete --> [*]: DELETE job
+  failed --> [*]: DELETE job
+```
+
+State mẫu, các timestamp dùng UTC ISO-8601:
+
+```json
+{
+  "id": "32-hex-characters",
+  "status": "running",
+  "stage": "synthesizing",
+  "voice_id": "32-hex-characters",
+  "language": "vi",
+  "quality": "balanced",
+  "tts_profile": "stable",
+  "denoise": "light",
+  "filename": "recording.webm",
+  "chunks_done": 2,
+  "chunks_total": 4,
+  "created_at": "UTC ISO-8601",
+  "updated_at": "UTC ISO-8601"
+}
+```
+
+### State machine: uploaded voice training
+
+```mermaid
+stateDiagram-v2
+  [*] --> not_started
+  not_started --> queued: người dùng yêu cầu fine-tune
+  queued --> preparing
+  preparing --> needs_more_data: dưới 5 phút hoặc 50 clip
+  preparing --> needs_data_review: đủ candidate
+  needs_data_review --> waiting_for_gpu: người dùng duyệt
+  waiting_for_gpu --> evaluating: precheck cần chạy
+  waiting_for_gpu --> training: precheck đã tái sử dụng
+  evaluating --> needs_review: WER gap lớn hơn 0.20
+  evaluating --> training: đạt gate
+  training --> complete: reload và register thành công
+  queued --> failed
+  preparing --> failed
+  evaluating --> failed
+  training --> failed
+  needs_more_data --> queued: bổ sung file và train lại
+  needs_review --> queued: sửa dữ liệu và train lại
+  failed --> queued: retry
+```
+
+Container restart chuyển các trạng thái đang hoạt động `queued`, `preparing`, `waiting_for_gpu`, `training`,
+`evaluating` thành `failed/interrupted`. Speech job có thể resume; optimizer training hiện không resume checkpoint.
+
+### State machine: guided recording
+
+```mermaid
+stateDiagram-v2
+  [*] --> recording: tạo session có consent
+  recording --> recording: thu, ASR, nghe và xác nhận clip
+  recording --> queued: ít nhất 50 clip và 300 giây
+  queued --> waiting_for_gpu
+  waiting_for_gpu --> training
+  training --> evaluating
+  evaluating --> complete: register voice
+  waiting_for_gpu --> failed
+  training --> failed
+  evaluating --> failed
+```
+
+Guided dataset chia deterministically bằng SHA-256 của session ID và filename. Ít nhất 5 câu được đưa vào validation
+và 5 câu vào test; các file trùng SHA-256 hoặc bị thay sau review bị từ chối.
+
+### Schema dữ liệu quan trọng
+
+Các JSON dưới đây là **schema minh họa**, không phải file chứa dữ liệu người dùng thật.
+
+#### Voice index
+
+```json
+[
+  {
+    "id": "32-hex-characters",
+    "name": "Tên hiển thị",
+    "locale": "vi-VN",
+    "kind": "reference hoặc finetuned",
+    "duration": 420.5,
+    "source": "tên nguồn hoặc corpus",
+    "source_file": "file nguồn cục bộ",
+    "run": "chỉ có khi kind là finetuned"
+  }
+]
+```
+
+Field có thể khác theo cách voice được tạo; code gọi phải dùng `.get()` cho metadata tùy chọn. Source media và
+reference WAV nằm trong `data/voices/`; training files bổ sung nằm trong `data/voices/training/`.
+
+#### Prepared dataset row và manifest
+
+```json
+{
+  "file_name": "000123.wav",
+  "text": "Câu đã chuẩn hóa và duyệt.",
+  "speaker_id": "VIVOSSPK13",
+  "language": "vi",
+  "source": "vivos",
+  "source_sha256": "sha256",
+  "duration": 6.42,
+  "split": "train"
+}
+```
+
+```json
+{
+  "source": {
+    "name": "Dataset name",
+    "language": "vi",
+    "license": "License text"
+  },
+  "source_id": "vivos",
+  "speaker_id": "VIVOSSPK13",
+  "locale": "vi-VN",
+  "counts": {"train": 240, "validation": 30, "test": 30},
+  "minutes": {"train": 14.1, "validation": 1.8, "test": 1.7},
+  "preparation": "Mô tả cách chuẩn bị"
+}
+```
+
+Corpus chuẩn có `train.jsonl`, `validation.jsonl`, `test.jsonl`, `train_metadata.csv`, `manifest.json` và
+`raw_audio/`. Upload cuối có thể dùng `full_training=true`, mọi clip duyệt thuộc train và evaluation pre-final nằm
+ở run riêng. Không được tự suy rằng mọi manifest đều có đủ ba split.
+
+#### Training run status
+
+```json
+{
+  "run": "run_name",
+  "dataset": "/absolute/path/to/prepared",
+  "source": "vivos",
+  "speaker_id": "VIVOSSPK13",
+  "status": "trained_pending_evaluation",
+  "max_steps": 90,
+  "optimizer_updates": 90,
+  "config": {
+    "batch_size": 2,
+    "grad_accum": 2,
+    "rank": 16,
+    "target": "backbone",
+    "lr": 0.0002
+  },
+  "upstream_commit": "git-sha",
+  "adapter": "/path/to/adapter_model.safetensors",
+  "adapter_sha256": "sha256",
+  "merged": "/path/to/merged",
+  "merged_sha256": "sha256",
+  "preset_sha256": "sha256",
+  "adapter_reload_verified": true,
+  "peak_gpu_mib": 12345,
+  "started_at": "UTC ISO-8601",
+  "finished_at": "UTC ISO-8601"
+}
+```
+
+Sau evaluation, state thêm `status=evaluated`, `evaluation`, `test_items`, `generated_wer`, `reference_wer` và có
+thể có `speaker_similarity`. Upload model cuối dùng `status=full_trained` trước khi register.
+
+#### Review state
+
+```json
+{
+  "approved": false,
+  "changes": {
+    "000123.wav": {"text": "Transcript đã sửa", "include": true},
+    "000124.wav": {"text": "Transcript cũ", "include": false}
+  }
+}
+```
+
+`review_candidates.jsonl` giữ candidate ban đầu. Khi approve, code tạo lại `train.jsonl` và
+`train_metadata.csv` qua file tạm, cập nhật counts/minutes và lưu `review_sha256`.
+
+### Thuật toán chính dưới dạng pseudocode
+
+#### Chọn speaker nói nhiều nhất
+
+```text
+decode media thành audio chuẩn
+segments = Whisper(audio, word_timestamps=true, VAD=true)
+với mỗi vùng lời đủ điều kiện:
+    embedding = frozen_speaker_encoder(wav_segment)
+gom embedding gần nhau bằng cosine threshold
+gộp các center gần như cùng giọng
+duration_per_cluster = tổng thời lượng segment trong cluster
+dominant_cluster = argmax(duration_per_cluster)
+chọn segment sạch và gần center để làm reference
+trả cluster, tỷ lệ thời lượng, timestamps và mức tin cậy
+```
+
+Đầu ra phụ thuộc vùng Whisper tìm thấy. “Nói nhiều nhất” nghĩa là tổng thời lượng trong các segment nhận diện được,
+không phải toàn bộ thời gian file và không phải nhận diện danh tính.
+
+#### Lọc giọng mục tiêu
+
+```text
+reference_embedding = encoder(reference 3-8 giây)
+stem_a, stem_b = MossFormer2(mixture_16k)
+score_a = cosine(encoder(stem_a speech regions), reference_embedding)
+score_b = cosine(encoder(stem_b speech regions), reference_embedding)
+nếu score cao nhất và margin đạt rule:
+    target = stem có score cao hơn
+    residual = mixture - target estimate
+ngược lại:
+    từ chối hoặc giữ đoạn không chắc chắn ở residual
+nếu enhance=true:
+    target = FRCRN(target)
+đưa target và residual về timeline nguồn
+mux lại video nếu đầu vào có hình
+```
+
+Rule còn dùng mixture/reference và margin để tránh chọn stem bị separation làm đổi màu giọng. Không được đơn giản
+hóa thành “stem có cosine lớn nhất luôn đúng”. Regression test nằm ở `tests/test_target_voice.py`.
+
+#### Speech-to-speech
+
+```text
+validate enum, voice_id, extension và kích thước
+lưu input vào thư mục job trước khi enqueue
+decode bằng FFmpeg thành mono 16 kHz
+áp high-pass 70 Hz và low-pass 7.6 kHz
+transcript = faster-whisper(profile.model, profile.beam, VAD)
+locale = language yêu cầu hoặc ngôn ngữ phát hiện
+chặn voice locale không khớp vi/en
+normalized_text = normalize_for_speech(transcript, locale)
+chunks = split theo dấu câu, tối đa 240 ký tự và không bỏ từ
+giữ _tts_lock và GPU file lock
+với từng chunk:
+    warm_worker.synthesize(chunk, voice_config, sampling_profile)
+concat PCM WAV bằng FFmpeg
+áp filter off, light hoặc strong
+lưu result và latency rồi xóa input tạm
+```
+
+Warm worker là subprocess giao tiếp qua JSON lines. Nó chỉ reload model khi config model/voice thay đổi; reference
+mode vẫn truyền reference WAV. TTS chunks được ghép tuần tự, không giữ timing gốc của input.
+
+#### Upload-to-LoRA
+
+```text
+snapshot voices.json và training files của voice
+decode mỗi nguồn; nếu clean=true thì lọc đúng target speaker
+Whisper từng cửa sổ dài và ghép word timestamp qua biên
+cắt clip 3-15 giây, loại trùng và clip không hợp lệ
+chọn hoặc cập nhật reference tốt nhất
+nếu usable < 300 giây hoặc clips < 50: needs_more_data rồi dừng
+nếu chưa được review: needs_data_review rồi dừng
+lấy GPU file lock
+nếu đủ dữ liệu và chưa có precheck hợp lệ:
+    tạo dataset có test tách riêng
+    train candidate 100 steps
+    evaluate held-out sentences
+nếu generated_WER - reference_WER > 0.20 và test_items >= 5:
+    needs_review và giữ adapter cũ
+thử full-data LoRA với batch 14, 12, 10, 8 khi đúng lỗi CUDA OOM
+xác minh optimizer update, artifact, enrollment và cold reload hash
+register voice mới
+ghi complete; không thay giọng cũ khi bất kỳ gate nào lỗi
+```
+
+#### WER/CER evaluation
+
+```text
+verify adapter SHA-256 chưa thay sau training
+sinh WAV cho câu test bằng merged model
+Whisper beam 5 đọc reference_wav và generated_wav
+normalize Unicode NFC, casefold, bỏ punctuation và gom whitespace
+WER = Levenshtein(words_target, words_prediction) / số từ target
+CER = Levenshtein(chars_target, chars_prediction) / số ký tự target
+lưu từng item và tổng metric vào evaluation/results.json
+```
+
+WER của generated WAV chứa cả lỗi TTS lẫn lỗi Whisper. So với WER reference trên cùng câu giúp nhìn baseline ASR,
+nhưng hiệu số vẫn không phải phép đo tự nhiên hoặc speaker identity.
+
+### Concurrency, khóa và vòng đời tài nguyên
+
+```mermaid
+flowchart TD
+  R["HTTP request hoặc worker"] --> G{"Cần GPU nặng?"}
+  G -->|"Không"| C["CPU, FFmpeg hoặc file operation"]
+  G -->|"Có"| L["fcntl lock worker.lock"]
+  L --> V{"Đủ VRAM tối thiểu?"}
+  V -->|"Không"| E["HTTP 503 và Retry-After 15"]
+  V -->|"Có"| P{"Loại tác vụ"}
+  P -->|"STT"| S["_stt_lock và cached Whisper"]
+  P -->|"TTS"| T["_tts_lock và warm subprocess"]
+  P -->|"Training"| X["Worker systemd hoặc subprocess"]
+  S --> U["Giải phóng file lock"]
+  T --> U
+  X --> U
+```
+
+- `_voice_lock` bảo vệ đọc/ghi `voices.json` trong process.
+- `_stt_lock` tránh nhiều thread dùng hoặc đổi cached Whisper cùng lúc.
+- `_tts_lock` tuần tự hóa warm VieNeu worker.
+- GPU file lock phối hợp API và process training trên cùng filesystem.
+- Training pool và speech pool đều `max_workers=1`; đây là backpressure cục bộ, không phải distributed scheduler.
+- API đợi GPU 30–300 giây tùy luồng rồi trả 503 có `Retry-After: 15`.
+- Một số path đặt ngưỡng VRAM trống khoảng 2.500–4.500 MiB. Đây là admission threshold, không phải tổng VRAM model.
+
+### Mã lỗi quan trọng
+
+| HTTP | Trường hợp điển hình | Client nên làm gì |
+| --- | --- | --- |
+| 400 | Chưa xác nhận consent | Yêu cầu người dùng xác nhận quyền sử dụng |
+| 404 | Voice, job, session, source hoặc media không tồn tại | Refresh state; không retry mù |
+| 408 | FFmpeg/media process quá timeout | Giảm file hoặc kiểm tra codec/hardware |
+| 409 | Xóa job đang chạy, session đã queue | Poll trạng thái hiện tại |
+| 413 | File vượt 500 MB hoặc guided clip vượt 25 MB | Nén hoặc chia nguồn trong giới hạn chức năng |
+| 415 | Extension không thuộc allowlist | Chuyển sang WAV/MP3/M4A/AAC/FLAC/OGG/Opus/WebM/MP4/MOV/MKV |
+| 422 | Schema, locale, profile, media hoặc transcript không hợp lệ | Hiển thị `detail`, sửa dữ liệu rồi gửi lại |
+| 503 | GPU lock bận hoặc VRAM thấp | Tôn trọng `Retry-After`, tránh retry storm |
+| 507 | Ổ đĩa dưới ngưỡng an toàn | Dọn cache/output hoặc tăng volume |
+
+### Bản đồ thay đổi dành cho AI
+
+| Yêu cầu | File phải đọc đầu tiên | File liên quan | Test hoặc gate tối thiểu |
+| --- | --- | --- | --- |
+| Đổi navigation/Studio | `src/main.jsx` | `src/style.css` | `npm run build`, thao tác browser |
+| Đổi recording/job UX | `src/SpeechToSpeech.jsx` | `server/app.py`, `server/speech_jobs.py` | `test_speech_jobs.py`, mic thật |
+| Đổi ASR profile | `server/speech_to_speech.py` | benchmark interactive STT | cùng held-out set và latency |
+| Giảm vấp text dài | `split_synthesis_text` | text normalization, warm worker | unit test không mất từ + bài nghe |
+| Đổi TTS sampling | `server/speech_to_speech.py` | benchmark speech-to-speech | WER, cosine, latency và nghe mù |
+| Đổi speaker clustering | `server/dominant_speaker.py` | benchmark interview | `test_dominant_speaker.py` |
+| Đổi keep/remove speaker | `server/target_voice.py` | `training/separate_speakers.py` | `test_target_voice.py`, residual thật |
+| Đổi segmentation | `training/uploaded_audio.py` | `training/upload_train.py` | boundary words và coverage test |
+| Đổi human review | `training/dataset_review.py` | `src/TrainingReview.jsx` | review hash và empty dataset test |
+| Đổi minimum data/gate | `training/upload_train.py` | library UI | precheck test, không thay adapter cũ |
+| Đổi LoRA/artifact | `training/run.py` | VieNeu upstream | optimizer, cold reload, held-out eval |
+| Đổi guided recording | `training/self_recording.py` | self train và UI | quality, split, consent, mic thật |
+| Đổi editor | `server/timeline.py` | media edit và `src/Editor.jsx` | duration, sync, codec, file thật |
+| Đổi persistence schema | module ghi JSON tương ứng | recovery và UI reader | migration fixture + restart test |
+| Thêm nhiều API replicas | `server/speech_jobs.py` | mọi lock/pool/file writer | cần queue/DB/object store trước |
+| Đổi Docker/CUDA | `Dockerfile`, `compose.yaml` | setup scripts, constraints | smoke + GPU inference/reload |
+| Đổi dependency | `requirements.txt` | lockfile và CI | regenerate lock, pytest, build |
+
+### Checklist AI phải trả lời trước thay đổi lớn
+
+1. Luồng hiện tại từ UI đến output là gì?
+2. Thay đổi thuộc frontend, API, worker, model, media hay storage?
+3. Endpoint, schema hoặc state nào đổi; client cũ còn tương thích không?
+4. Có làm mất restart recovery hoặc thay adapter cũ khi candidate lỗi không?
+5. Có bỏ qua consent, file validation, path validation hoặc GPU lock không?
+6. Có migration cho JSON/file đã tồn tại và Docker volume không?
+7. Test CPU nào chứng minh contract; test GPU/audio nào chứng minh chất lượng?
+8. Metric nào đo đúng yêu cầu và metric nào chỉ là proxy?
+9. Artifact nào commit, artifact nào ở release, artifact nào phải private?
+10. Cách rollback code, image, schema và adapter là gì?
 
 ## Kiến trúc và luồng xử lý
 
