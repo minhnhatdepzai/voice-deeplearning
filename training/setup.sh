@@ -11,4 +11,6 @@ git -C "$UPSTREAM" checkout --detach "$COMMIT"
 cd "$UPSTREAM"
 uv sync --extra finetune --no-dev --python 3.12
 uv pip install --python "$UPSTREAM/.venv/bin/python" 'onnxruntime<1.24'
+"$UPSTREAM/.venv/bin/python" -c 'import torch, vieneu, onnxruntime'
+touch "$UPSTREAM/.ready"
 printf 'Training environment ready: %s\n' "$UPSTREAM"

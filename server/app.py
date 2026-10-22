@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import tempfile
 import time
@@ -17,7 +18,7 @@ import uuid
 import tarfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,11 +36,13 @@ from server.text_normalization import normalize_for_speech
 from server.target_voice import process as extract_target_voice
 from server.dominant_speaker import analyze as find_dominant_speaker
 from server.realtime_voice import WarmVoiceWorker
+from server.speech_jobs import SpeechJobs
 from server.speech_to_speech import (MAX_SPEECH_TO_SPEECH_BYTES, postprocess_filter,
                                      recognition_profile, split_synthesis_text,
                                      synthesis_profile, validate_utterance)
 from training import self_recording
 from training import uploaded_audio
+from training import dataset_review
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -68,6 +71,8 @@ _stt_model_name = None
 _training_pool = ThreadPoolExecutor(max_workers=1)
 _training_jobs: dict[str, dict] = {}
 _training_lock = threading.Lock()
+_speech_job_pool = ThreadPoolExecutor(max_workers=1)
+_speech_jobs = SpeechJobs(DATA / "speech_jobs")
 
 
 @contextmanager
@@ -116,7 +121,40 @@ PREPARED = DATA / "prepared"
 RUNS = DATA / "training_runs"
 _warm_voice = WarmVoiceWorker(ROOT, DATA)
 
-app = FastAPI(title="Vocalab Local API", version="1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    if os.environ.get("VOICE_STUDIO_WORKER_MODE") == "subprocess":
+        for status_path in (DATA / "upload_training").glob("*/status.json"):
+            try:
+                state = json.loads(status_path.read_text(encoding="utf-8"))
+                if state.get("status") in {"queued", "preparing", "waiting_for_gpu", "training", "evaluating"}:
+                    uploaded_audio.save(status_path.parent.name, status="failed", stage="interrupted",
+                                        error="Container khởi động lại khi đang train. Bấm fine-tune lại để tiếp tục.")
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    _resume_speech_jobs()
+    yield
+
+
+app = FastAPI(title="Vocalab Local API", version="1.0", lifespan=_lifespan)
+
+
+def _launch_training_worker(unit: str, description: str, module: str, *arguments: str) -> str:
+    """Use systemd on desktop; direct child processes inside a container."""
+    worker = [sys.executable, "-m", module, *arguments]
+    if os.environ.get("VOICE_STUDIO_WORKER_MODE") == "subprocess":
+        logs = DATA / "worker_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        with (logs / f"{unit}.log").open("ab") as output:
+            process = subprocess.Popen(worker, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, start_new_session=True)
+        return f"pid={process.pid}"
+    command = ["systemd-run", "--user", "--unit", unit, "--description", description,
+               f"--working-directory={ROOT}", *worker]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip()[-300:])
+    return completed.stdout.strip()
 
 
 def _read_voices() -> list[dict]:
@@ -355,18 +393,18 @@ def start_self_training(session_id: str):
     elif state["status"] != "queued":
         raise HTTPException(409, "Phiên này đã được đưa vào hàng đợi hoặc đã huấn luyện.")
     unit = f"vocalab-self-{session_id[:16]}"
-    command = ["systemd-run", "--user", "--unit", unit, "--description", f"Vocalab guided voice {session_id[:8]}",
-               f"--working-directory={ROOT}", str(ROOT / ".venv/bin/python"), "-m", "training.self_train", "--session", session_id]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
-    if completed.returncode:
+    try:
+        worker = _launch_training_worker(unit, f"Vocalab guided voice {session_id[:8]}",
+                                         "training.self_train", "--session", session_id)
+    except (OSError, RuntimeError) as exc:
         state = _session_or_404(session_id)
-        state["dispatch_error"] = f"Không khởi động được worker: {completed.stderr.strip()[-300:]}"
+        state["dispatch_error"] = f"Không khởi động được worker: {exc}"
         self_recording.write_state(state)
         raise HTTPException(500, state["dispatch_error"])
     state = _session_or_404(session_id)
     if state.pop("dispatch_error", None):
         self_recording.write_state(state)
-    return {"session": self_recording.public_state(_session_or_404(session_id)), "unit": unit, "worker": completed.stdout.strip()}
+    return {"session": self_recording.public_state(_session_or_404(session_id)), "unit": unit, "worker": worker}
 
 
 def _archive_ready(source: str) -> bool:
@@ -659,15 +697,23 @@ async def create_voice(file: UploadFile = File(...), name: str = Form(...), star
 
 
 @app.delete("/api/voices/{voice_id}")
-def delete_voice(voice_id: str):
+def delete_voice(voice_id: str, purge_derived: bool = False):
+    if not re.fullmatch(r"[a-f0-9]{32}", voice_id):
+        raise HTTPException(404)
     training = uploaded_audio.load(voice_id)
     if training and training.get("status") in {"queued", "preparing", "waiting_for_gpu", "training", "evaluating"}:
         raise HTTPException(409, "Đang huấn luyện từ file này. Chờ hoàn tất trước khi xóa.")
     with _voice_lock:
         voices = _read_voices()
-        updated = [item for item in voices if item["id"] != voice_id]
-        if len(updated) == len(voices):
+        original = next((item for item in voices if item["id"] == voice_id), None)
+        if original is None:
             raise HTTPException(404, "Không tìm thấy giọng nói.")
+        removed_ids = {voice_id}
+        if purge_derived:
+            removed_ids.update(item["id"] for item in voices if item.get("origin_voice_id") == voice_id)
+        if any(state.get("voice_id") in removed_ids for state in _speech_jobs.unfinished()):
+            raise HTTPException(409, "Giọng đang được dùng trong job đổi giọng. Hãy đợi hoàn tất rồi xóa.")
+        updated = [item for item in voices if item["id"] not in removed_ids]
         for item in updated:
             if item.get("origin_voice_id") == voice_id:
                 item.pop("origin_voice_id", None)
@@ -676,12 +722,29 @@ def delete_voice(voice_id: str):
                 if preview.is_file():
                     item["duration"] = round(_duration(preview), 1)
         _write_voices(updated)
-    (VOICES / f"{voice_id}.wav").unlink(missing_ok=True)
-    if item := next((voice for voice in voices if voice["id"] == voice_id), None):
+    for removed_id in removed_ids:
+        (VOICES / f"{removed_id}.wav").unlink(missing_ok=True)
+    if item := original:
         if item.get("source_file") and re.fullmatch(re.escape(voice_id) + r"\.[a-z0-9]+", item["source_file"]):
             (VOICE_SOURCES / item["source_file"]).unlink(missing_ok=True)
     shutil.rmtree(VOICE_TRAINING_FILES / voice_id, ignore_errors=True)
-    return {"ok": True}
+    if purge_derived:
+        _warm_voice.stop()
+        for path in PREPARED.glob(f"upload_{voice_id}_*"):
+            if path.is_dir():
+                shutil.rmtree(path)
+        for path in RUNS.glob(f"upload_{voice_id}_*"):
+            if path.is_dir():
+                shutil.rmtree(path)
+        shutil.rmtree(DATA / "upload_training" / voice_id, ignore_errors=True)
+        for state_path in (DATA / "speech_jobs").glob("*/status.json"):
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if state.get("voice_id") in removed_ids and state.get("status") not in {"queued", "running"}:
+                    delete_speech_job(state["id"])
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    return {"ok": True, "purged_derived": purge_derived, "removed_voices": len(removed_ids)}
 
 
 @app.post("/api/voices/{voice_id}/training-files")
@@ -795,7 +858,7 @@ def train_full_voice(voice_id: str, clean: bool = False):
     if not voice.get("source_file") or not (VOICE_SOURCES / voice["source_file"]).is_file():
         raise HTTPException(422, "Giọng này không còn file gốc đầy đủ; hãy tải lên lại để fine-tune.")
     previous = uploaded_audio.load(voice_id)
-    if previous and previous.get("status") not in {"failed", "not_started", "complete", "needs_more_data", "needs_review"}:
+    if previous and previous.get("status") not in {"failed", "not_started", "complete", "needs_more_data", "needs_review", "needs_data_review"}:
         raise HTTPException(409, "File này đã được gửi huấn luyện. Xem tiến độ ở thư viện giọng.")
     attempt = (previous or {}).get("attempt", 0) + 1
     _warm_voice.stop()
@@ -804,13 +867,71 @@ def train_full_voice(voice_id: str, clean: bool = False):
                         source_name=voice["source"], name=voice["name"], locale=voice["locale"], attempt=attempt,
                         clean_before_training=clean, error=None, reason=None)
     unit = f"vocalab-upload-{voice_id[:16]}-r{attempt}"
-    command = ["systemd-run", "--user", "--unit", unit, "--description", f"Vocalab full file voice {voice_id[:8]}",
-               f"--working-directory={ROOT}", str(ROOT / ".venv/bin/python"), "-m", "training.upload_train", "--voice", voice_id]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
-    if completed.returncode:
-        uploaded_audio.save(voice_id, status="failed", error=f"Không khởi động được worker: {completed.stderr.strip()[-300:]}")
-        raise HTTPException(500, completed.stderr.strip()[-300:])
+    try:
+        _launch_training_worker(unit, f"Vocalab full file voice {voice_id[:8]}",
+                                "training.upload_train", "--voice", voice_id)
+    except (OSError, RuntimeError) as exc:
+        uploaded_audio.save(voice_id, status="failed", error=f"Không khởi động được worker: {exc}")
+        raise HTTPException(500, str(exc)) from exc
     return uploaded_audio.load(voice_id)
+
+
+def _review_dataset(voice_id: str) -> Path:
+    _get_voice(voice_id)
+    state = uploaded_audio.load(voice_id)
+    if not state or not state.get("dataset"):
+        raise HTTPException(404, "Chưa có clip đã chuẩn bị để duyệt.")
+    dataset = Path(state["dataset"])
+    if dataset.parent != DATA / "prepared" or not dataset.name.startswith(f"upload_{voice_id}_"):
+        raise HTTPException(500, "Đường dẫn bộ dữ liệu không hợp lệ.")
+    return dataset
+
+
+class ReviewEdit(BaseModel):
+    text: str
+    include: bool = True
+
+
+@app.get("/api/voices/{voice_id}/training-review")
+def get_training_review(voice_id: str, offset: int = 0, limit: int = 25):
+    if offset < 0 or limit < 1 or limit > 100:
+        raise HTTPException(422, "Trang clip không hợp lệ.")
+    return dataset_review.load(_review_dataset(voice_id), offset, limit)
+
+
+@app.get("/api/voices/{voice_id}/training-review/{filename}")
+def get_training_clip(voice_id: str, filename: str):
+    dataset = _review_dataset(voice_id)
+    if not re.fullmatch(r"\d{6}\.wav", filename):
+        raise HTTPException(404)
+    path = dataset / "raw_audio" / filename
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="audio/wav")
+
+
+@app.put("/api/voices/{voice_id}/training-review/{filename}")
+def edit_training_clip(voice_id: str, filename: str, request: ReviewEdit):
+    state = uploaded_audio.load(voice_id) or {}
+    if state.get("status") != "needs_data_review":
+        raise HTTPException(409, "Chỉ sửa clip khi đang ở bước duyệt dữ liệu.")
+    try:
+        dataset_review.edit(_review_dataset(voice_id), filename, request.text, request.include)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"saved": True}
+
+
+@app.post("/api/voices/{voice_id}/training-review/approve")
+def approve_training_review(voice_id: str):
+    state = uploaded_audio.load(voice_id) or {}
+    if state.get("status") != "needs_data_review":
+        raise HTTPException(409, "Chưa đến bước duyệt dữ liệu.")
+    try:
+        review = dataset_review.approve(_review_dataset(voice_id))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"approved": review["approved"], "training": train_full_voice(voice_id, clean=bool(state.get("clean_before_training")))}
 
 
 @app.get("/api/voices/{voice_id}/source")
@@ -1131,7 +1252,7 @@ def _prepare_warm_voice(voice: dict) -> dict:
 
 
 def _synthesize_interactive(voice: dict, text: str, output: Path, locale: str,
-                            tts_profile: str = "stable", denoise: str = "light") -> dict:
+                            tts_profile: str = "stable", denoise: str = "light", progress=None) -> dict:
     normalized = normalize_for_speech(text, locale)
     chunks = split_synthesis_text(normalized)
     if not chunks:
@@ -1149,6 +1270,8 @@ def _synthesize_interactive(voice: dict, text: str, output: Path, locale: str,
                     chunk, partial, mode=config["mode"], model=config.get("model"),
                     voice=config.get("voice"), reference=config.get("reference"), sampling=synthesis_profile(tts_profile),
                 ))
+                if progress:
+                    progress("synthesizing", index + 1, len(chunks))
             if len(partials) > 1:
                 concat_list.write_text("".join(f"file '{part.resolve().as_posix()}'\n" for part in partials), encoding="utf-8")
                 _run("ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "concat", "-safe", "0",
@@ -1198,6 +1321,11 @@ def release_speech_to_speech():
 async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(...),
                            language: str = Form("vi"), quality: str = Form("balanced"),
                            tts_profile: str = Form("stable"), denoise: str = Form("light")):
+    return await _speech_to_speech_impl(file, voice_id, language, quality, tts_profile, denoise)
+
+
+async def _speech_to_speech_impl(file: UploadFile, voice_id: str, language: str, quality: str,
+                                tts_profile: str, denoise: str, progress=None):
     if language not in {"auto", "vi", "en"}:
         raise HTTPException(422, "Ngôn ngữ không hợp lệ.")
     try:
@@ -1213,6 +1341,8 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
     generated = OUTPUTS / f"{output_id}.wav"
     began = time.perf_counter()
     try:
+        if progress:
+            progress("decoding")
         duration = await asyncio.to_thread(_duration, source)
         try:
             validate_utterance(duration, source.stat().st_size)
@@ -1222,6 +1352,8 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
                                 "-vn", "-ac", "1", "-ar", "16000", "-af", "highpass=f=70,lowpass=f=7600",
                                 str(audio))
         decoded_at = time.perf_counter()
+        if progress:
+            progress("transcribing")
         rows, detected, stt_warm = await asyncio.to_thread(
             _transcribe, audio, language, model_name=profile.model, beam_size=profile.beam_size)
         transcript = " ".join(row["text"] for row in rows).strip()
@@ -1234,7 +1366,9 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
             raise HTTPException(422, "Giọng đầu ra này được train bằng tiếng Anh; hãy chọn giọng tiếng Việt.")
         if locale == "en-US" and voice_locale == "vi-VN":
             raise HTTPException(422, "Giọng đầu ra này được train bằng tiếng Việt; hãy chọn giọng tiếng Anh.")
-        result = await asyncio.to_thread(_synthesize_interactive, voice, transcript, generated, locale, tts_profile, denoise)
+        if progress:
+            progress("synthesizing", 0, len(split_synthesis_text(normalize_for_speech(transcript, locale))))
+        result = await asyncio.to_thread(_synthesize_interactive, voice, transcript, generated, locale, tts_profile, denoise, progress)
         finished = time.perf_counter()
         return {"text": transcript, "language": detected, "voice_id": voice_id,
                 "voice_name": voice["name"], "audio_url": f"/api/media/outputs/{generated.name}",
@@ -1252,6 +1386,85 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
         audio.unlink(missing_ok=True)
         if not generated.is_file():
             generated.unlink(missing_ok=True)
+
+
+def _run_speech_job(job_id: str) -> None:
+    state = _speech_jobs.get(job_id)
+    if not state:
+        return
+    source = _speech_jobs.directory(job_id) / "input"
+    if not source.is_file():
+        _speech_jobs.put(job_id, status="failed", error="File đầu vào của job đã mất.")
+        return
+    _speech_jobs.put(job_id, status="running", stage="queued", error=None)
+    try:
+        with source.open("rb") as handle:
+            upload = UploadFile(file=handle, filename=state.get("filename", "recording.webm"))
+            result = asyncio.run(_speech_to_speech_impl(
+                upload, state["voice_id"], state["language"], state["quality"],
+                state["tts_profile"], state["denoise"],
+                lambda stage, done=None, total=None: _speech_jobs.put(job_id, stage=stage, chunks_done=done, chunks_total=total)))
+        _speech_jobs.put(job_id, status="complete", stage="complete", result=result)
+        source.unlink(missing_ok=True)
+    except Exception as exc:
+        message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        _speech_jobs.put(job_id, status="failed", stage="failed", error=str(message)[:500])
+        source.unlink(missing_ok=True)
+
+
+def _resume_speech_jobs():
+    # A single Uvicorn worker owns this in-process queue. Inputs remain on disk
+    # until successful completion, so interrupted jobs can be retried at startup.
+    for state in _speech_jobs.unfinished():
+        _speech_job_pool.submit(_run_speech_job, state["id"])
+
+
+@app.post("/api/speech-to-speech/jobs", status_code=202)
+async def create_speech_job(file: UploadFile = File(...), voice_id: str = Form(...),
+                            language: str = Form("vi"), quality: str = Form("balanced"),
+                            tts_profile: str = Form("stable"), denoise: str = Form("light")):
+    _get_voice(voice_id)
+    if language not in {"auto", "vi", "en"}:
+        raise HTTPException(422, "Ngôn ngữ không hợp lệ.")
+    try:
+        recognition_profile(quality)
+        synthesis_profile(tts_profile)
+        postprocess_filter(denoise)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    job_id = uuid.uuid4().hex
+    directory = _speech_jobs.directory(job_id)
+    directory.mkdir(parents=True)
+    temporary = await _save_upload(file, max_bytes=MAX_SPEECH_TO_SPEECH_BYTES)
+    temporary.replace(directory / "input")
+    state = _speech_jobs.put(job_id, status="queued", stage="queued", voice_id=voice_id,
+                             language=language, quality=quality, tts_profile=tts_profile, denoise=denoise,
+                             filename=Path(file.filename or "recording.webm").name)
+    _speech_job_pool.submit(_run_speech_job, job_id)
+    return state
+
+
+@app.get("/api/speech-to-speech/jobs/{job_id}")
+def get_speech_job(job_id: str):
+    try:
+        state = _speech_jobs.get(job_id)
+    except ValueError:
+        state = None
+    if not state:
+        raise HTTPException(404, "Job không tồn tại.")
+    return state
+
+
+@app.delete("/api/speech-to-speech/jobs/{job_id}")
+def delete_speech_job(job_id: str):
+    state = get_speech_job(job_id)
+    if state["status"] in {"queued", "running"}:
+        raise HTTPException(409, "Job đang chạy; hãy đợi hoàn tất rồi xóa.")
+    output = (state.get("result") or {}).get("audio_url", "")
+    if re.fullmatch(r"/api/media/outputs/[a-f0-9]{32}\.wav", output):
+        (OUTPUTS / Path(output).name).unlink(missing_ok=True)
+    _speech_jobs.delete(job_id)
+    return {"deleted": True}
 
 
 @app.post("/api/stt")

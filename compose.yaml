@@ -1,0 +1,35 @@
+services:
+  vocalab:
+    build: .
+    image: vocalab:local
+    ports:
+      - "127.0.0.1:${VOCALAB_PORT:-8000}:8000"
+    environment:
+      VOICE_STUDIO_BOOTSTRAP_MODE: ${VOICE_STUDIO_BOOTSTRAP_MODE:-auto}
+      VOICE_STUDIO_WORKER_MODE: subprocess
+      HF_HOME: /app/data/huggingface
+    volumes:
+      - vocalab-data:/app/data
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15m
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  vocalab-data:

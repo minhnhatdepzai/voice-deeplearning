@@ -1,0 +1,13 @@
+.git
+.venv
+node_modules
+dist
+data
+__pycache__
+.pytest_cache
+*.pyc
+*.log
+.env*
+!.env.example
+kaggle.json
+release_assets

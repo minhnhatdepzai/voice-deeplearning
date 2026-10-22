@@ -33,6 +33,7 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
   const [elapsed, setElapsed] = useState(0)
   const [history, setHistory] = useState([])
   const [warmup, setWarmup] = useState(null)
+  const [job, setJob] = useState(null)
   const runtime = useRef({})
   const runId = useRef(0)
 
@@ -72,8 +73,44 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
   useEffect(() => () => {
     runId.current += 1
     releaseBrowser()
-    fetch('/api/speech-to-speech/release', { method: 'POST' }).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    const saved = localStorage.getItem('vocalab-speech-job')
+    if (saved) { setJob({ id: saved, status: 'queued', stage: 'queued' }); setPhase('processing') }
+  }, [])
+
+  useEffect(() => {
+    if (!job?.id || job.status === 'complete' || job.status === 'failed') return
+    let active = true
+    const poll = async () => {
+      try {
+        const state = await api(`/speech-to-speech/jobs/${job.id}`)
+        if (!active) return
+        setJob(state)
+        if (state.status === 'complete') {
+          localStorage.removeItem('vocalab-speech-job')
+          const result = state.result
+          setHistory(previous => [{ ...result, id: state.id, at: new Date().toLocaleTimeString('vi-VN') }, ...previous].slice(0, 12))
+          const player = new Audio(result.audio_url)
+          runtime.current.player = player
+          setPhase('playing')
+          const finish = () => { runtime.current.player = null; setPhase('idle') }
+          player.onended = finish; player.onerror = finish
+          player.play().catch(finish)
+        } else if (state.status === 'failed') {
+          localStorage.removeItem('vocalab-speech-job')
+          onError(state.error || 'Không thể đổi giọng bản ghi.')
+          setPhase('idle')
+        }
+      } catch (error) {
+        if (active) { onError(error.message); setPhase('idle'); localStorage.removeItem('vocalab-speech-job') }
+      }
+    }
+    poll()
+    const timer = setInterval(poll, 2000)
+    return () => { active = false; clearInterval(timer) }
+  }, [job?.id, job?.status])
 
   function monitorInput(id) {
     const state = runtime.current
@@ -95,15 +132,10 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
       form.append('file', new File([blob], `speech-${Date.now()}.${extension}`, { type: mimeType }))
       form.append('voice_id', voiceId); form.append('language', language); form.append('quality', quality)
       form.append('denoise', denoise)
-      const result = await api('/speech-to-speech', { method: 'POST', body: form })
+      const result = await api('/speech-to-speech/jobs', { method: 'POST', body: form })
       if (id !== runId.current) return
-      setHistory(previous => [{ ...result, id: crypto.randomUUID(), at: new Date().toLocaleTimeString('vi-VN') }, ...previous].slice(0, 12))
-      const player = new Audio(result.audio_url)
-      runtime.current.player = player
-      setPhase('playing')
-      const finish = () => { if (id === runId.current) { runtime.current.player = null; setPhase('idle') } }
-      player.onended = finish; player.onerror = finish
-      await player.play().catch(finish)
+      localStorage.setItem('vocalab-speech-job', result.id)
+      setJob(result)
     } catch (error) {
       if (id === runId.current) { onError(error.message); setPhase('idle') }
     }
@@ -186,7 +218,7 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
         </select></div>
         <div className="s2s-options"><label><span>Ngôn ngữ nói</span><select value={language} disabled={active} onChange={event => setLanguage(event.target.value)}><option value="vi">Tiếng Việt</option><option value="en">English</option><option value="auto">Tự nhận diện</option></select></label><label><span>Độ chính xác</span><select value={quality} disabled={active} onChange={event => setQuality(event.target.value)}><option value="fast">Nhanh · Whisper small beam 1</option><option value="balanced">Cân bằng · Whisper turbo beam 3</option><option value="accurate">Chuẩn hơn · Whisper turbo beam 5</option></select></label><label><span>Lọc tiếng ù đầu ra</span><select value={denoise} disabled={active} onChange={event => setDenoise(event.target.value)}><option value="light">Nhẹ · giữ tự nhiên</option><option value="strong">Mạnh · ít nền hơn</option><option value="off">Tắt lọc</option></select></label></div>
         <div className={`s2s-orb ${phase}`}><div className="s2s-level" style={{ transform: `scale(${1 + level * .32})` }}/>{phase === 'recording' ? <AudioLines size={46}/> : phase === 'processing' || phase === 'warming' ? <Zap size={44}/> : <Mic2 size={46}/>}</div>
-        <div className="s2s-state"><span className={`state-dot ${active ? 'live' : ''}`}/><strong>{phaseLabels[phase]}</strong>{phase === 'recording' && <small>Đã thu {formatDuration(elapsed)} · chỉ xử lý khi bấm Dừng & nghe</small>}{phase === 'processing' && <small>File dài sẽ được chia nhỏ khi tạo giọng rồi ghép lại thành một bản</small>}</div>
+        <div className="s2s-state"><span className={`state-dot ${active ? 'live' : ''}`}/><strong>{phaseLabels[phase]}</strong>{phase === 'recording' && <small>Đã thu {formatDuration(elapsed)} · chỉ xử lý khi bấm Dừng & nghe</small>}{phase === 'processing' && <small>{({ queued: 'Đang chờ', decoding: 'Đang giải mã', transcribing: 'Đang nhận dạng lời nói', synthesizing: 'Đang tạo giọng' })[job?.stage] || 'Đang tải bản ghi'}{job?.chunks_total ? ` · ${job.chunks_done || 0}/${job.chunks_total} đoạn` : ''} · có thể tải lại trang để xem tiếp</small>}</div>
         <button type="button" className={`button full ${active ? 'outline danger' : 'primary'}`} onClick={button.action} disabled={button.disabled}>{button.icon} {button.text}</button>
         <p className="fine-print">Không có bộ đếm tự dừng. Giới hạn thực tế phụ thuộc bộ nhớ trình duyệt và dung lượng tải lên tối đa 500 MB. Đeo tai nghe để tránh micro thu lại âm thanh từ loa.</p>
       </section>

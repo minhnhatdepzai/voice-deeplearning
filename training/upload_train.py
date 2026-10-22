@@ -20,6 +20,7 @@ import soundfile as sf
 from training.self_train import DATA, PYTHON, ROOT, TRAIN_PYTHON, command, register
 from training.pipeline import sha256_file
 from training.uploaded_audio import build, load, now, save
+from training import dataset_review
 from server.target_voice import process as extract_target_voice
 
 
@@ -60,7 +61,8 @@ def prior_evaluation(manifest: dict) -> str | None:
             state = json.loads(status_path.read_text(encoding="utf-8"))
             prior = json.loads((Path(state["dataset"]) / "manifest.json").read_text(encoding="utf-8"))
             if (state["status"] == "evaluated" and prior.get("archive_sha256") == manifest["archive_sha256"]
-                    and prior.get("clean_before_training", False) == manifest.get("clean_before_training", False)):
+                    and prior.get("clean_before_training", False) == manifest.get("clean_before_training", False)
+                    and prior.get("review_sha256") == manifest.get("review_sha256")):
                 candidates.append((prior.get("voice_id") == manifest.get("voice_id"),
                                    "filtered" not in state["run"] and "vocals" not in state["run"], state["run"]))
         except (OSError, KeyError, ValueError):
@@ -126,6 +128,16 @@ def run(voice_id: str) -> int:
     reference = DATA / "voices" / f"{voice_id}.wav"
     source_key = combined_key(source_paths, reference if clean else None)
     dataset = DATA / "prepared" / f"upload_{voice_id}_{'clean_v3' if clean else 'full_v2'}"
+    # Refreshing the reference preview may rewrite its WAV after preparation.
+    # A human-approved dataset must survive that harmless reference change.
+    if (dataset / "manifest.json").is_file() and (dataset / "review.json").is_file():
+        existing = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+        reviewed = json.loads((dataset / "review.json").read_text(encoding="utf-8"))
+        files = existing.get("source_files", [])
+        if (reviewed.get("approved") and len(files) == len(source_paths)
+                and all(row.get("sha256") == sha256_file(path) for row, path in zip(files, source_paths))
+                and existing.get("clean_before_training", False) == clean):
+            source_key = existing["archive_sha256"]
     lock_file = DATA / "auto_train/worker.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     attempt = (load(voice_id) or {}).get("attempt", 1)
@@ -192,6 +204,20 @@ def run(voice_id: str) -> int:
                  source_seconds=manifest["source_seconds"], usable_seconds=manifest["usable_seconds"],
                  train_clips=total, rejected=manifest["rejected"],
                  reason="Sau khi lọc đúng người còn dưới 5 phút hoặc 50 đoạn lời nói. Hãy thu/tải thêm giọng sạch và sửa transcript trước khi fine-tune lại; adapter cũ vẫn được giữ.")
+            return 0
+        review = dataset_review.load(dataset, limit=0)
+        if not review["approved"]:
+            save(voice_id, status="needs_data_review", stage="review", dataset=str(dataset),
+                 source_seconds=manifest["source_seconds"], usable_seconds=manifest["usable_seconds"],
+                 train_clips=review["total"],
+                 reason="Nghe từng clip, sửa lời Whisper và bỏ đoạn lẫn người/nhiễu; sau đó bấm Duyệt và train.")
+            return 0
+        manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+        total = sum(manifest["counts"].values())
+        if clean and (manifest["usable_seconds"] < 300 or total < 50):
+            save(voice_id, status="needs_more_data", stage="review", dataset=str(dataset),
+                 usable_seconds=manifest["usable_seconds"], train_clips=total,
+                 reason="Sau khi duyệt còn dưới 5 phút hoặc 50 đoạn. Cần bổ sung bản thu sạch.")
             return 0
         # About 20 passes through accepted training clips.
         steps = max(100, math.ceil(manifest["counts"]["train"] * 20 / (14 * 2)))
