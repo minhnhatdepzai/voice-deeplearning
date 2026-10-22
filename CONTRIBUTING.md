@@ -8,7 +8,7 @@ recordings, model caches and generated outputs live in ignored `data/`.
 ## Local setup
 
 Use Python 3.12, Node 22, `ffmpeg`, and optionally an NVIDIA GPU. Run
-`npm ci`, create `.venv`, install `requirements.lock` and `pytest`, then run
+`npm ci`, create `.venv`, install `requirements-dev.txt`, then run
 `npm run build` and `.venv/bin/python -m pytest -q`. `./run.sh` installs the
 application dependencies and starts the local API. `bash training/setup.sh`
 installs the pinned VieNeu upstream training environment. Use
