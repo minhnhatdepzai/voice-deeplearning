@@ -72,8 +72,13 @@ def _write(path: Path, rate: int, data: array.array) -> None:
 
 def _shape(source: Path, target: Path, pace: float, pitch: float, gain: float) -> None:
     factor = 2 ** (pitch / 12)
-    filters = f"rubberband=tempo={pace:.5f}:pitch={factor:.6f}:formant=preserved,volume={gain:.3f}dB,aresample=24000"
-    proc = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source), "-af", filters,
+    filters = []
+    if abs(pace - 1) > 1e-4 or abs(pitch) > 1e-4:
+        filters.append(f"rubberband=tempo={pace:.5f}:pitch={factor:.6f}:formant=preserved")
+    if abs(gain) > 1e-4:
+        filters.append(f"volume={gain:.3f}dB")
+    filters.append("aresample=24000")
+    proc = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source), "-af", ",".join(filters),
                            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(target)], capture_output=True, timeout=120)
     if proc.returncode:
         raise ValueError(proc.stderr.decode(errors="replace")[-400:])
@@ -97,7 +102,9 @@ def combine(raw_files: list[Path], segments: list[dict], output: Path) -> dict:
                 _, samples = _samples(normalized)
             start_sample = len(result)
             start = start_sample / rate
-            if settings["contour"] == "level" or len(samples) < rate:
+            if settings["contour"] == "level" and abs(settings["pace"] - 1) < 1e-4 and abs(settings["pitch"]) < 1e-4 and abs(settings["gain"]) < 1e-4:
+                pass  # Natural playback keeps the model's samples unchanged.
+            elif settings["contour"] == "level" or len(samples) < rate:
                 shaped = directory / f"shaped-{index}.wav"
                 _write(directory / f"input-{index}.wav", rate, samples)
                 _shape(directory / f"input-{index}.wav", shaped, settings["pace"], settings["pitch"], settings["gain"])

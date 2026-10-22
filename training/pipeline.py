@@ -183,7 +183,7 @@ def build(source: str, archive_path: Path, speaker: str, output: Path, max_clips
                 rejected["decode_error"] += 1
                 target.unlink(missing_ok=True)
                 continue
-            if not 1 <= duration <= 20 or rms < 0.004:
+            if not 3 <= duration <= 15 or rms < 0.004:
                 rejected["duration_or_silence"] += 1
                 target.unlink(missing_ok=True)
                 continue

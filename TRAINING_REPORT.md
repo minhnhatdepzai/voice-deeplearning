@@ -1,6 +1,29 @@
 # Báo cáo huấn luyện và đánh giá công khai
 
-Ngày ghi nhận: 14/10/2026. Model nền: VieNeu-TTS v3 Turbo; recipe upstream tại commit `bd0f88eb8de7d560753a6172ba9c868f309a101c`. Mỗi run dùng một speaker. Các con số bên dưới lấy từ kết quả cục bộ đã lưu và được tóm tắt, không công bố audio nguồn hay transcript cá nhân.
+Ngày cập nhật: 22/10/2026. Model nền: VieNeu-TTS v3 Turbo. Các adapter công khai trong bảng được tạo bằng recipe upstream tại commit `bd0f88eb8de7d560753a6172ba9c868f309a101c`; hai ứng viên cục bộ mới dùng commit `04044e1b8f822f946bafb2c88b716459f4164152`. Mỗi run dùng một speaker. Các con số bên dưới lấy từ kết quả cục bộ đã lưu và được tóm tắt, không công bố audio nguồn hay transcript cá nhân.
+
+## Cập nhật pipeline 22/10/2026
+
+- Bổ sung tách theo giọng tham chiếu bằng MossFormer2_SS_16K, chọn stem với encoder VieNeu và giảm nhiễu tùy chọn bằng FRCRN_SE_16K. Bản WAV sau lọc có thể nghe/tải; video xuất MP4 với hình gốc. Dữ liệu train mới đi qua tách giọng trước ASR/LoRA.
+- Thử tích hợp trên bản trộn hai mẫu giọng 6,4 giây: tương quan Pearson giữa giọng mục tiêu gốc với audio hỗn hợp là **0,918**, với WAV mục tiêu sau xử lý là **0,946**; tương quan giữa giọng mục tiêu và WAV phần dư là **−0,057**. Đây là **một bản trộn thử**, không phải benchmark tổng quát về độ tách, chất lượng nghe hoặc độ giống người nói.
+- Kiểm tra một nguồn video dài 194 giây: với mẫu tham chiếu hiện có, lần chạy đầu chấp nhận 6/18 chunk. Chấm lại hai stem đã lưu bằng ngưỡng có xét tương đồng file hỗn hợp cho **13/18 chunk**. Số chunk chỉ là chỉ báo chọn giọng, không chứng minh từng âm tiết sạch; video vẫn ngắn hơn mức tối thiểu 5 phút lời nói sạch cho quy trình train mới.
+- Thư viện ban đầu có 18 adapter fine-tune và 4 mục giọng upload còn file nguồn; 3 mục upload trỏ đến cùng nội dung video, mục thứ tư là nguồn khác. Không có dữ liệu một người nói mới để train lại tất cả giọng. Hai adapter ứng viên được train lại từ **chính dữ liệu cũ** để so recipe/cấu hình; chúng không thắng benchmark 19 câu nên **không thay adapter đang dùng và không được đăng ký vào thư viện**. Chế độ TTS `Tự nhiên` giờ giữ nguyên PCM model khi không chỉnh cao độ/nhịp/âm lượng.
+- Worker mới yêu cầu ít nhất 5 phút và 50 clip sau lọc. Precheck giữ ít nhất 5 câu test riêng; nếu WER AI kém bản gốc quá 20 điểm phần trăm, dừng trước khi train cuối/thay adapter. WER là proxy từ Whisper, không đo độ tự nhiên. Dữ liệu bổ sung có thể tải thêm cho từng giọng đã lưu; cần bản thu mới, đúng người, ít nhiễu và kiểm tra transcript.
+
+## Speech to speech và vòng lặp thử nghiệm 22/10/2026
+
+- Trang **Speech to speech** dùng VAD trong trình duyệt, 350 ms tiền đệm, chốt câu sau khoảng 680 ms im lặng, gửi WAV tới FastAPI, nhận dạng bằng faster-whisper rồi tạo lại bằng giọng VieNeu đã chọn. Whisper và một VieNeu worker được giữ nóng; khi đổi sang một model fine-tune khác, worker nạp lại model tương ứng. API trả riêng thời gian decode/STT/TTS/tổng.
+- Trên 19 câu VIVOSSPK15 test: `small` beam 1 đạt WER **13,58%**, inference **2,24 giây** cho cả 19 câu; `turbo` beam 3 đạt **4,32%**, **3,74 giây**; `turbo` beam 5 vẫn **4,32%**, **3,93 giây**. Mặc định vì vậy là `turbo` beam 3. Tải model từ cache mất khoảng 1,3–1,7 giây; VieNeu fine-tune nạp khoảng 4,8–7,0 giây. Khi giữ cả hai model, GPU dùng khoảng 3,2 GiB trên RTX 5060 Ti 16 GiB trong phép kiểm tra.
+- Với adapter upload hiện tại `abc · Fine-tune toàn file`, 19 lượt HTTP sau warmup đạt WER đầu vào **4,94%**, WER của WAV đầu ra khi Whisper đọc lại **9,26%**, cosine so với mẫu giọng **0,5274** và latency xử lý trung bình **550 ms/lượt**. Auto-VAD thêm khoảng 680 ms sau âm cuối trước khi gửi. Đây là số đo pipeline cục bộ trên câu ngắn, không phải cam kết thời gian cho máy khác.
+- Ba cấu hình sampling VieNeu được thử trên cùng 8 câu. `natural` đạt WER đầu ra **17,74%**, cosine **0,4911**; `clear` đạt **12,90%**, **0,4764**; `stable` đạt **9,68%**, **0,5042**. Pipeline tương tác mặc định `stable` (`temperature=0.35`, `top_k=15`, `top_p=0.85`) vì thắng trên bộ này. Kết quả sinh có tính ngẫu nhiên; cần bài nghe người thật trước khi kết luận tự nhiên hơn.
+- Hậu xử lý 19 WAV với bốn mức cho thấy bản gốc WER **9,26%**, cosine **0,5274**, noise-floor proxy **−59,24 dBFS**; lọc nhẹ đạt **8,64%**, **0,5303**, **−61,39 dBFS**; lọc mạnh đạt **8,64%**, **0,5379**, **−62,29 dBFS**. Giao diện mặc định lọc nhẹ để giảm nguy cơ tạo artifact; người dùng có thể chọn mạnh hoặc tắt. Noise floor là proxy trên frame năng lượng thấp, chưa phải đánh giá cảm nhận.
+- Hai adapter ứng viên mới dùng cùng dữ liệu upload cũ khoảng 2,75 phút: `upload_098_latest_r16_s120` (rank 16, target all, 120 bước, LR `1e-4`) và `upload_098_latest_r8_s180` (rank 8, target backbone, 180 bước, LR `5e-5`). Cả hai merge/reload thành công. Trên 19 câu ngoài dữ liệu upload, model đang dùng đạt WER/cosine **9,26% / 0,5274**; ứng viên rank 16 đạt **10,49% / 0,4767**; ứng viên rank 8 đạt **10,49% / 0,5077**. Vì model cũ thắng cả hai chỉ số trong lượt mở rộng, không ứng viên nào được promote. Kết quả này cũng cho thấy tăng bước train không thay thế được dữ liệu sạch mới.
+
+## Benchmark phỏng vấn tiếng Anh 22/10/2026
+
+Benchmark hai người nói LibriTTS CC BY 4.0 dài 11 phút 10 giây đã được tạo ở ba mức nhiễu. Sau khi sửa ngưỡng gộp cụm, cả ba mức đều tìm đúng hai cụm và cụm chính khớp speaker `8297`; ở bản đường phố SNR 10 dB, cosine với khách mời là **0,8376**, với người phỏng vấn là **0,5860**. Bản khó nhất được tách toàn bộ 61/61 cửa sổ.
+
+Hai adapter mới được train 100 bước trên 8,87 phút audio đã tách và trên bản trộn 13,02 phút có thêm dữ liệu sạch. So công bằng trên cùng 22 câu/380 từ chưa train: baseline hiện tại đạt WER **3,16%**, ứng viên chỉ phỏng vấn **4,47%**, ứng viên trộn **4,21%**. Ứng viên trộn có cosine AI với WAV gốc **0,8603**, nhỉnh hơn baseline **0,8553**, nhưng có 16 lỗi từ thay vì 12. Vì mục tiêu phát âm rõ và ít vấp, baseline được giữ; hai ứng viên không được đăng ký. Xem [báo cáo đầy đủ](docs/ENGLISH_INTERVIEW_BENCHMARK_2026-10-22.md).
 
 ## Kết quả từng adapter
 

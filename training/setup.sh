@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM="$ROOT/data/upstream/vieneu"
-COMMIT="bd0f88eb8de7d560753a6172ba9c868f309a101c"
+COMMIT="04044e1b8f822f946bafb2c88b716459f4164152"
 if [ ! -d "$UPSTREAM/.git" ]; then
   mkdir -p "$(dirname "$UPSTREAM")"
   git clone https://github.com/pnnbao97/VieNeu-TTS.git "$UPSTREAM"

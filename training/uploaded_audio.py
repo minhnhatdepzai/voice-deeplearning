@@ -60,10 +60,10 @@ def word_groups(segments) -> list[tuple[float, float, str]]:
             current.append(word)
         if current:
             groups.append((current[0].start, current[-1].end, "".join(w.word for w in current).strip()))
-    # Merge short neighboring phrases without ever exceeding the model's utterance limit.
+    # Merge short neighboring phrases within VieNeu's current 3-15 second recipe.
     merged = []
     for start, end, text in groups:
-        if merged and end - merged[-1][0] <= 18 and start - merged[-1][1] <= .8 and merged[-1][1] - merged[-1][0] < 5:
+        if merged and end - merged[-1][0] <= 15 and start - merged[-1][1] <= .8 and merged[-1][1] - merged[-1][0] < 5:
             before = merged.pop()
             merged.append((before[0], end, before[2] + " " + text))
         else:
@@ -172,7 +172,7 @@ def build(voice: dict, source: Path, output: Path, progress=None) -> dict:
                 end_frame = min(wav.getnframes(), round((end + .08) * 24000))
                 duration = (end_frame - start_frame) / 24000
                 key = text_key(text)
-                if not .25 <= duration <= 20:
+                if not 3 <= duration <= 15:
                     rejected["duration"] += 1
                     continue
                 if not key:
@@ -223,7 +223,7 @@ def build(voice: dict, source: Path, output: Path, progress=None) -> dict:
                     "counts": dict(counts), "minutes": minutes, "rejected": dict(rejected),
                     "asr_device": asr_device,
                     "transcript": f"Automatic faster-whisper small {asr_device}; review transcript before relying on voice quality",
-                    "preparation": "Entire source transcribed in bounded chunks; every detected speech clip used for final training; no speaker filtering or holdout"}
+                    "preparation": "Entire source transcribed in bounded chunks; 3-15 second clips follow the current VieNeu recipe; no speaker filtering or holdout"}
         (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest
     finally:

@@ -17,6 +17,29 @@ from training.pipeline import sha256_file
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def select_reference(train_rows: list[dict], manifest: dict) -> dict:
+    """Pick a stable, high-quality enrollment clip for the exported voice."""
+    eligible = [row for row in train_rows if 3 <= float(row.get("duration", 0)) <= 8]
+    if not eligible:
+        eligible = train_rows
+    preferred = manifest.get("reference_file")
+    if preferred:
+        match = next((row for row in eligible if row.get("file_name") == preferred), None)
+        if not match:
+            raise ValueError(f"manifest reference_file is missing or ineligible: {preferred}")
+        return match
+
+    def quality(row: dict) -> tuple[float, float]:
+        # Direct clean clips do not carry extraction_cosine and receive the
+        # highest default score. Extracted clips compete on measured identity.
+        score = row.get("reference_score")
+        if score is None:
+            score = row.get("extraction_cosine", 1.0)
+        return float(score), -abs(float(row.get("duration", 0)) - 5.5)
+
+    return max(eligible, key=quality)
+
+
 def run(dataset: Path, upstream: Path, steps: int, run_name: str, batch_size: int = 2,
         grad_accum: int = 2, rank: int = 16, target: str = "backbone", lr: float = 2e-4) -> dict:
     dataset = dataset.resolve()
@@ -93,7 +116,7 @@ def run(dataset: Path, upstream: Path, steps: int, run_name: str, batch_size: in
         if not any(record.get("step", 0) > 0 and "loss" in record for record in steps_logged):
             raise RuntimeError("No optimizer update recorded")
         train_rows = [json.loads(line) for line in (dataset / "train.jsonl").read_text(encoding="utf-8").splitlines()]
-        reference = next((row for row in train_rows if 3 <= row["duration"] <= 8), train_rows[0])
+        reference = select_reference(train_rows, manifest)
         if manifest.get("full_training"):
             call("enrolling", [str(python), "-m", "training.enroll_all", "--parquet", str(parquet),
                                "--merged", str(merged), "--name", manifest["speaker_id"],

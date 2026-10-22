@@ -23,7 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from training.pipeline import SOURCES, build as build_training_dataset, read_archive
+from training.pipeline import SOURCES, build as build_training_dataset, read_archive, sha256_file
 from training.run import run as run_training
 from training.evaluate import evaluate as evaluate_training
 from training.benchmark_fpt import benchmark as benchmark_fpt
@@ -32,6 +32,10 @@ from server.prosody import combine as combine_delivery, plan as plan_delivery
 from server.media_edit import decode as decode_audio, mix as mix_audio
 from server.timeline import render as render_timeline
 from server.text_normalization import normalize_for_speech
+from server.target_voice import process as extract_target_voice
+from server.dominant_speaker import analyze as find_dominant_speaker
+from server.realtime_voice import WarmVoiceWorker
+from server.speech_to_speech import postprocess_filter, recognition_profile, synthesis_profile, validate_utterance
 from training import self_recording
 from training import uploaded_audio
 
@@ -43,18 +47,22 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("VOICE_STUDIO_DATA", ROOT / "data"))
 VOICES = DATA / "voices"
 VOICE_SOURCES = VOICES / "sources"
+VOICE_TRAINING_FILES = VOICES / "training"
 OUTPUTS = DATA / "outputs"
 UPLOADS = DATA / "uploads"
-for directory in (VOICES, VOICE_SOURCES, OUTPUTS, UPLOADS):
+for directory in (VOICES, VOICE_SOURCES, VOICE_TRAINING_FILES, OUTPUTS, UPLOADS):
     directory.mkdir(parents=True, exist_ok=True)
 INDEX = DATA / "voices.json"
 ALLOWED = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm", ".mp4", ".mov", ".mkv"}
 VIDEO = {".mp4", ".mov", ".mkv", ".webm"}
 MAX_BYTES = 500 * 1024 * 1024
+MAX_LONG_RECORDING_SECONDS = 60 * 60
 _voice_lock = threading.Lock()
 _tts_lock = threading.Lock()
 _stt_lock = threading.Lock()
 _stt_device = None
+_stt_model = None
+_stt_model_name = None
 _training_pool = ThreadPoolExecutor(max_workers=1)
 _training_jobs: dict[str, dict] = {}
 _training_lock = threading.Lock()
@@ -104,6 +112,7 @@ FPT_SOURCE = {"name": "FPT Open Speech Dataset", "language": "vi", "original": "
               "role": "STT benchmark; speaker IDs absent in mirror"}
 PREPARED = DATA / "prepared"
 RUNS = DATA / "training_runs"
+_warm_voice = WarmVoiceWorker(ROOT, DATA)
 
 app = FastAPI(title="Vocalab Local API", version="1.0")
 
@@ -207,7 +216,8 @@ def _srt_time(seconds: float) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "tts_backend": "VieNeu CUDA subprocess", "stt_device_last_used": _stt_device,
+    return {"ok": True, "tts_backend": "VieNeu CUDA warm worker", "stt_device_last_used": _stt_device,
+            "speech_to_speech_worker": _warm_voice.status(), "stt_model_warm": _stt_model_name,
             "ffmpeg": shutil.which("ffmpeg") is not None}
 
 
@@ -235,6 +245,12 @@ class SelfSessionRequest(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     locale: str = Field(pattern=r"^(vi-VN|en-US)$")
     consent: bool
+
+
+class SpeechWarmupRequest(BaseModel):
+    voice_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    quality: str = Field(default="balanced", pattern=r"^(fast|balanced|accurate)$")
+    language: str = Field(default="vi", pattern=r"^(vi|en|auto)$")
 
 
 def _session_or_404(session_id: str) -> dict:
@@ -445,6 +461,8 @@ def start_training(request: TrainRequest):
     upstream = Path(os.environ.get("VIENEU_UPSTREAM", DATA / "upstream/vieneu"))
     if not (upstream / ".venv/bin/python").is_file():
         raise HTTPException(422, "Chưa cài môi trường training. Chạy training/setup.sh.")
+    _warm_voice.stop()
+    _release_stt_model()
     run_name = f"{request.dataset}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:4]}"
     def work():
         with _gpu_slot(wait_seconds=None):
@@ -463,6 +481,8 @@ def start_training_evaluation(request: EvaluateRequest):
     run_dir = RUNS / request.run
     if not (run_dir / "status.json").is_file():
         raise HTTPException(404, "Không tìm thấy phiên fine-tune.")
+    _warm_voice.stop()
+    _release_stt_model()
     upstream = Path(os.environ.get("VIENEU_UPSTREAM", DATA / "upstream/vieneu"))
     def work():
         with _gpu_slot(wait_seconds=None):
@@ -582,7 +602,8 @@ def list_voices():
 
 @app.post("/api/voices")
 async def create_voice(file: UploadFile = File(...), name: str = Form(...), start: float = Form(0),
-                       consent: bool = Form(False), locale: str = Form("vi-VN")):
+                       consent: bool = Form(False), locale: str = Form("vi-VN"),
+                       speaker_mode: str = Form("manual")):
     name = name.strip()
     if not consent:
         raise HTTPException(400, "Bạn cần xác nhận quyền sử dụng giọng nói này.")
@@ -592,6 +613,8 @@ async def create_voice(file: UploadFile = File(...), name: str = Form(...), star
         raise HTTPException(422, "Thời điểm bắt đầu không hợp lệ.")
     if locale not in {"vi-VN", "en-US"}:
         raise HTTPException(422, "Ngôn ngữ giọng nói không hợp lệ.")
+    if speaker_mode not in {"manual", "dominant"}:
+        raise HTTPException(422, "Cách chọn người nói không hợp lệ.")
     source_name = Path(file.filename or "media").name[:150]
     source = await _save_upload(file, max_bytes=None)
     voice_id = uuid.uuid4().hex
@@ -599,15 +622,27 @@ async def create_voice(file: UploadFile = File(...), name: str = Form(...), star
     original = VOICE_SOURCES / f"{voice_id}{source.suffix}"
     try:
         duration = await asyncio.to_thread(_duration, source)
-        if duration - start < 3:
+        if duration > MAX_LONG_RECORDING_SECONDS + 1:
+            raise HTTPException(422, "File nguồn được dài tối đa 60 phút.")
+        if speaker_mode == "manual" and duration - start < 3:
             raise HTTPException(422, "Cần ít nhất 3 giây tiếng nói sau điểm bắt đầu.")
-        await asyncio.to_thread(_run, "ffmpeg", "-y", "-v", "error", "-ss", str(start), "-i", str(source), "-t", "8", "-vn", "-ac", "1", "-ar", "44100", str(clip))
+        dominant = None
+        if speaker_mode == "dominant":
+            with tempfile.TemporaryDirectory(prefix="vocalab-dominant-", dir=UPLOADS) as directory:
+                with _gpu_slot(wait_seconds=60, min_free_mib=2500):
+                    dominant = await asyncio.to_thread(find_dominant_speaker, source, Path(directory), locale)
+                await asyncio.to_thread(_run, "ffmpeg", "-y", "-v", "error", "-i", dominant["reference"],
+                                        "-t", "8", "-ac", "1", "-ar", "44100", str(clip))
+        else:
+            await asyncio.to_thread(_run, "ffmpeg", "-y", "-v", "error", "-ss", str(start), "-i", str(source), "-t", "8", "-vn", "-ac", "1", "-ar", "44100", str(clip))
         shutil.move(source, original)
         item = {"id": voice_id, "name": name, "source": source_name, "locale": locale,
                 "created_at": datetime.now(timezone.utc).isoformat(), "duration": round(duration, 1),
                 "reference_duration": round(min(8, duration - start), 1),
                 "source_file": original.name, "source_url": f"/api/voices/{voice_id}/source",
                 "preview_url": f"/api/media/voices/{voice_id}.wav"}
+        if dominant:
+            item["speaker_selection"] = {key: value for key, value in dominant.items() if key != "reference"}
         with _voice_lock:
             voices = _read_voices()
             voices.append(item)
@@ -643,7 +678,49 @@ def delete_voice(voice_id: str):
     if item := next((voice for voice in voices if voice["id"] == voice_id), None):
         if item.get("source_file") and re.fullmatch(re.escape(voice_id) + r"\.[a-z0-9]+", item["source_file"]):
             (VOICE_SOURCES / item["source_file"]).unlink(missing_ok=True)
+    shutil.rmtree(VOICE_TRAINING_FILES / voice_id, ignore_errors=True)
     return {"ok": True}
+
+
+@app.post("/api/voices/{voice_id}/training-files")
+async def add_voice_training_file(voice_id: str, file: UploadFile = File(...), consent: bool = Form(False)):
+    if not consent:
+        raise HTTPException(400, "Bạn cần xác nhận quyền dùng bản thu này để huấn luyện.")
+    voice = _get_voice(voice_id)
+    if not voice.get("source_file"):
+        raise HTTPException(422, "Chỉ có thể bổ sung dữ liệu cho giọng đã tải file gốc lên.")
+    state = uploaded_audio.load(voice_id)
+    if state and state.get("status") in {"queued", "preparing", "waiting_for_gpu", "training", "evaluating"}:
+        raise HTTPException(409, "Giọng đang train; hãy đợi hoàn tất rồi bổ sung bản thu.")
+    source = await _save_upload(file)
+    destination_dir = VOICE_TRAINING_FILES / voice_id
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f"{uuid.uuid4().hex}{source.suffix}"
+    try:
+        duration = await asyncio.to_thread(_duration, source)
+        if not 3 <= duration <= MAX_LONG_RECORDING_SECONDS + 1:
+            raise HTTPException(422, "Mỗi bản thu bổ sung cần dài 3 giây đến 60 phút.")
+        digest = await asyncio.to_thread(sha256_file, source)
+        with _voice_lock:
+            voices = _read_voices()
+            item = next((row for row in voices if row["id"] == voice_id), None)
+            if item is None:
+                raise HTTPException(404, "Giọng đã bị xóa.")
+            existing = [VOICE_SOURCES / item["source_file"]]
+            existing.extend(VOICE_TRAINING_FILES / voice_id / row["file"] for row in item.get("training_files", []))
+            if any(path.is_file() and sha256_file(path) == digest for path in existing):
+                raise HTTPException(409, "File này đã có trong dữ liệu của giọng; cần bản thu mới.")
+            shutil.move(source, destination)
+            item.setdefault("training_files", []).append({"file": destination.name,
+                                                          "original_name": Path(file.filename or "media").name[:150],
+                                                          "duration": round(duration, 1), "sha256": digest})
+            _write_voices(voices)
+        return item
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        source.unlink(missing_ok=True)
 
 
 @app.get("/api/voices/{voice_id}/training")
@@ -668,9 +745,12 @@ def uploaded_voice_training(voice_id: str):
 
 
 @app.post("/api/voices/{voice_id}/refresh-reference")
-def refresh_uploaded_reference(voice_id: str):
+def refresh_uploaded_reference(voice_id: str, clean: bool | None = None):
     voice = _get_voice(voice_id)
     full_dataset = PREPARED / f"upload_{voice_id}_full_v2"
+    clean_dataset = PREPARED / f"upload_{voice_id}_clean_v3"
+    if clean is not False and (clean_dataset / "manifest.json").is_file():
+        full_dataset = clean_dataset
     dataset = full_dataset if (full_dataset / "manifest.json").is_file() else PREPARED / f"upload_{voice_id}"
     manifest_path = dataset / "manifest.json"
     train_path = dataset / "train.jsonl"
@@ -708,17 +788,19 @@ def refresh_uploaded_reference(voice_id: str):
 
 
 @app.post("/api/voices/{voice_id}/train-full")
-def train_full_voice(voice_id: str):
+def train_full_voice(voice_id: str, clean: bool = False):
     voice = _get_voice(voice_id)
     if not voice.get("source_file") or not (VOICE_SOURCES / voice["source_file"]).is_file():
         raise HTTPException(422, "Giọng này không còn file gốc đầy đủ; hãy tải lên lại để fine-tune.")
     previous = uploaded_audio.load(voice_id)
-    if previous and previous.get("status") not in {"failed", "not_started", "complete"}:
+    if previous and previous.get("status") not in {"failed", "not_started", "complete", "needs_more_data", "needs_review"}:
         raise HTTPException(409, "File này đã được gửi huấn luyện. Xem tiến độ ở thư viện giọng.")
     attempt = (previous or {}).get("attempt", 0) + 1
+    _warm_voice.stop()
+    _release_stt_model()
     uploaded_audio.save(voice_id, status="queued", stage="queued", source_seconds=voice["duration"],
                         source_name=voice["source"], name=voice["name"], locale=voice["locale"], attempt=attempt,
-                        error=None)
+                        clean_before_training=clean, error=None, reason=None)
     unit = f"vocalab-upload-{voice_id[:16]}-r{attempt}"
     command = ["systemd-run", "--user", "--unit", unit, "--description", f"Vocalab full file voice {voice_id[:8]}",
                f"--working-directory={ROOT}", str(ROOT / ".venv/bin/python"), "-m", "training.upload_train", "--voice", voice_id]
@@ -823,6 +905,78 @@ async def separate_source(file: UploadFile = File(...)):
         source.unlink(missing_ok=True)
 
 
+@app.post("/api/target-voice")
+async def target_voice(file: UploadFile = File(...), voice_id: str | None = Form(None),
+                       reference: UploadFile | None = File(None), mode: str = Form("keep"),
+                       enhance: bool = Form(True), consent: bool = Form(False),
+                       auto_dominant: bool = Form(False), locale: str = Form("vi-VN")):
+    if not consent:
+        raise HTTPException(400, "Bạn cần xác nhận quyền xử lý giọng của người này.")
+    if mode not in {"keep", "remove"} or sum((bool(voice_id), bool(reference), auto_dominant)) != 1:
+        raise HTTPException(422, "Chọn đúng một cách nhận diện: tự tìm người nói nhiều nhất, giọng đã lưu hoặc mẫu tham chiếu.")
+    if locale not in {"vi-VN", "en-US"}:
+        raise HTTPException(422, "Ngôn ngữ giọng nói không hợp lệ.")
+    if voice_id:
+        voice = _get_voice(voice_id)
+        ref_path = VOICES / f"{voice['id']}.wav"
+        if not ref_path.is_file():
+            raise HTTPException(422, "Không tìm thấy mẫu giọng tham chiếu.")
+    elif reference:
+        ref_path = await _save_upload(reference)
+    else:
+        ref_path = None
+    source = None
+    output_id = uuid.uuid4().hex
+    produced = []
+    try:
+        source = await _save_upload(file)
+        with tempfile.TemporaryDirectory(prefix="vocalab-target-", dir=UPLOADS) as temp:
+            with _gpu_slot(wait_seconds=60, min_free_mib=4500):
+                dominant = (await asyncio.to_thread(find_dominant_speaker, source, Path(temp) / "dominant", locale)
+                            if auto_dominant else None)
+                if dominant:
+                    ref_path = Path(dominant["reference"])
+                result = await asyncio.to_thread(extract_target_voice, source, ref_path, Path(temp), enhance=enhance)
+            if result["selected_chunks"] == 0:
+                raise HTTPException(422, "Không xác nhận được người nói này trong file. Hãy dùng mẫu tham chiếu 3–8 giây sạch và đúng người.")
+            target_out = OUTPUTS / f"{output_id}_target.wav"
+            removed_out = OUTPUTS / f"{output_id}_without_target.wav"
+            shutil.copyfile(result["target"], target_out)
+            shutil.copyfile(result["without_target"], removed_out)
+            produced.extend([target_out, removed_out])
+            response = {"target_url": f"/api/media/outputs/{target_out.name}",
+                        "without_target_url": f"/api/media/outputs/{removed_out.name}",
+                        "video_url": None, "mode": mode, "method": result["method"],
+                        "selected_chunks": result["selected_chunks"], "total_chunks": result["total_chunks"],
+                        "duration": result["duration"],
+                        "quality_note": "Các đoạn không đủ chắc chắn được giữ trong bản bỏ giọng và để im trong bản chỉ giọng. Giọng chồng nhau hoặc trên hai người có thể còn sót."}
+            if dominant:
+                response["speaker_selection"] = {key: value for key, value in dominant.items() if key != "reference"}
+            if source.suffix.lower() in VIDEO:
+                video_out = OUTPUTS / f"{output_id}_{mode}.mp4"
+                chosen = target_out if mode == "keep" else removed_out
+                await asyncio.to_thread(_run, "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
+                                        "-i", str(chosen), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+                                        "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-af", "apad",
+                                        "-shortest", "-movflags", "+faststart", str(video_out))
+                produced.append(video_out)
+                response["video_url"] = f"/api/media/outputs/{video_out.name}"
+            return response
+    except (ValueError, RuntimeError) as exc:
+        for path in produced:
+            path.unlink(missing_ok=True)
+        raise HTTPException(422, str(exc)) from exc
+    except Exception:
+        for path in produced:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        if source:
+            source.unlink(missing_ok=True)
+        if reference and not voice_id and ref_path:
+            ref_path.unlink(missing_ok=True)
+
+
 @app.post("/api/tts")
 async def synthesize(voice_id: str = Form(...), text: str = Form(...), delivery: str | None = Form(None),
                      video: UploadFile | None = File(None), source: UploadFile | None = File(None),
@@ -913,20 +1067,170 @@ async def synthesize(voice_id: str = Form(...), text: str = Form(...), delivery:
             path.unlink(missing_ok=True)
 
 
-def _transcribe(path: Path, language: str):
-    global _stt_device
-    with _stt_lock, _gpu_slot(min_free_mib=2500):
-        from training.gpu_whisper import make_whisper
-        model, _stt_device = make_whisper(os.environ.get("WHISPER_MODEL", "small"))
+def _release_stt_model() -> None:
+    global _stt_model, _stt_model_name
+    with _stt_lock:
+        _stt_model = None
+        _stt_model_name = None
+        gc.collect()
+
+
+def _ensure_stt_model(model_name: str) -> bool:
+    """Load one Whisper model and return True when it was already warm."""
+    global _stt_model, _stt_model_name, _stt_device
+    if _stt_model is not None and _stt_model_name == model_name:
+        return True
+    _stt_model = None
+    _stt_model_name = None
+    gc.collect()
+    from training.gpu_whisper import make_whisper
+    _stt_model, _stt_device = make_whisper(model_name)
+    _stt_model_name = model_name
+    return False
+
+
+def _transcribe(path: Path, language: str, *, model_name: str | None = None, beam_size: int = 5):
+    chosen = model_name or os.environ.get("WHISPER_MODEL", "small")
+    with _stt_lock, _gpu_slot(min_free_mib=0 if _stt_model_name == chosen else 2500):
         try:
-            segments, info = model.transcribe(str(path), language=None if language == "auto" else language, vad_filter=True, beam_size=5)
-            rows = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in segments]
-            return rows, info.language
+            warm = _ensure_stt_model(chosen)
+            segments, info = _stt_model.transcribe(
+                str(path), language=None if language == "auto" else language,
+                vad_filter=True, vad_parameters={"min_silence_duration_ms": 350},
+                beam_size=beam_size, condition_on_previous_text=False,
+            )
+            rows = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+                    for s in segments if s.text.strip()]
+            return rows, info.language, warm
         except Exception as exc:
             raise HTTPException(500, f"STT thất bại: {exc}") from exc
-        finally:
-            del model
-            gc.collect()
+
+
+def _warm_voice_config(voice: dict) -> dict:
+    reference = VOICES / f"{voice['id']}.wav"
+    if not reference.is_file():
+        raise HTTPException(404, "File giọng nói đã mất.")
+    if voice.get("kind") != "finetuned":
+        return {"mode": "reference", "reference": reference}
+    run_dir = RUNS / voice["run"]
+    status_path = run_dir / "status.json"
+    if not status_path.is_file():
+        raise HTTPException(422, "Không tìm thấy model của giọng đã train.")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status.get("status") not in {"evaluated", "full_trained"}:
+        raise HTTPException(422, "Giọng fine-tune chưa hoàn tất.")
+    return {"mode": "trained", "model": Path(status["merged"]), "voice": status["speaker_id"],
+            "reference": reference}
+
+
+def _prepare_warm_voice(voice: dict) -> dict:
+    config = _warm_voice_config(voice)
+    return _warm_voice.prepare(config["mode"], config.get("model"), config.get("voice"))
+
+
+def _synthesize_interactive(voice: dict, text: str, output: Path, locale: str,
+                            tts_profile: str = "stable", denoise: str = "light") -> dict:
+    normalized = normalize_for_speech(text, locale)
+    config = _warm_voice_config(voice)
+    with _tts_lock, _gpu_slot(wait_seconds=300, min_free_mib=4000):
+        try:
+            result = _warm_voice.synthesize(
+                normalized, output, mode=config["mode"], model=config.get("model"),
+                voice=config.get("voice"), reference=config.get("reference"), sampling=synthesis_profile(tts_profile),
+            )
+            audio_filter = postprocess_filter(denoise)
+            if audio_filter:
+                cleaned = output.with_name(output.stem + ".clean.wav")
+                try:
+                    _run("ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(output),
+                         "-af", audio_filter, str(cleaned))
+                    cleaned.replace(output)
+                finally:
+                    cleaned.unlink(missing_ok=True)
+            return result
+        except Exception as exc:
+            output.unlink(missing_ok=True)
+            raise HTTPException(500, f"Tạo giọng tương tác thất bại: {exc}") from exc
+
+
+@app.post("/api/speech-to-speech/warmup")
+async def warm_speech_to_speech(request: SpeechWarmupRequest):
+    voice = _get_voice(request.voice_id)
+    profile = recognition_profile(request.quality)
+    began = time.perf_counter()
+    with _stt_lock, _gpu_slot(wait_seconds=300, min_free_mib=0 if _stt_model_name == profile.model else 2500):
+        stt_warm = await asyncio.to_thread(_ensure_stt_model, profile.model)
+    with _tts_lock, _gpu_slot(wait_seconds=300, min_free_mib=4000):
+        tts_state = await asyncio.to_thread(_prepare_warm_voice, voice)
+    return {"ready": True, "stt_model": profile.model, "stt_device": _stt_device,
+            "stt_was_warm": stt_warm, "tts_was_warm": tts_state["warm"],
+            "tts_load_ms": tts_state["load_ms"],
+            "warmup_ms": round((time.perf_counter() - began) * 1000)}
+
+
+@app.post("/api/speech-to-speech/release")
+def release_speech_to_speech():
+    _warm_voice.stop()
+    return {"released": True}
+
+
+@app.post("/api/speech-to-speech")
+async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(...),
+                           language: str = Form("vi"), quality: str = Form("balanced"),
+                           tts_profile: str = Form("stable"), denoise: str = Form("light")):
+    if language not in {"auto", "vi", "en"}:
+        raise HTTPException(422, "Ngôn ngữ không hợp lệ.")
+    try:
+        profile = recognition_profile(quality)
+        synthesis_profile(tts_profile)
+        postprocess_filter(denoise)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    voice = _get_voice(voice_id)
+    source = await _save_upload(file, max_bytes=25 * 1024 * 1024)
+    output_id = uuid.uuid4().hex
+    audio = UPLOADS / f"{output_id}.wav"
+    generated = OUTPUTS / f"{output_id}.wav"
+    began = time.perf_counter()
+    try:
+        duration = await asyncio.to_thread(_duration, source)
+        try:
+            validate_utterance(duration, source.stat().st_size)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        await asyncio.to_thread(_run, "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
+                                "-vn", "-ac", "1", "-ar", "16000", "-af", "highpass=f=70,lowpass=f=7600",
+                                str(audio))
+        decoded_at = time.perf_counter()
+        rows, detected, stt_warm = await asyncio.to_thread(
+            _transcribe, audio, language, model_name=profile.model, beam_size=profile.beam_size)
+        transcript = " ".join(row["text"] for row in rows).strip()
+        if not transcript:
+            raise HTTPException(422, "Không nghe rõ lời nói. Hãy đưa micro gần hơn và thử lại.")
+        transcribed_at = time.perf_counter()
+        locale = "en-US" if (language == "en" or detected == "en") else "vi-VN"
+        voice_locale = voice.get("locale") or ("vi-VN" if voice.get("source") == "vivos" else None)
+        if locale == "vi-VN" and voice_locale in {"en", "en-US"}:
+            raise HTTPException(422, "Giọng đầu ra này được train bằng tiếng Anh; hãy chọn giọng tiếng Việt.")
+        if locale == "en-US" and voice_locale == "vi-VN":
+            raise HTTPException(422, "Giọng đầu ra này được train bằng tiếng Việt; hãy chọn giọng tiếng Anh.")
+        result = await asyncio.to_thread(_synthesize_interactive, voice, transcript, generated, locale, tts_profile, denoise)
+        finished = time.perf_counter()
+        return {"text": transcript, "language": detected, "voice_id": voice_id,
+                "voice_name": voice["name"], "audio_url": f"/api/media/outputs/{generated.name}",
+                "input_seconds": round(duration, 2), "stt_model": profile.model,
+                "tts_profile": tts_profile, "denoise": denoise,
+                "stt_device": _stt_device, "stt_was_warm": stt_warm,
+                "tts_was_warm": result["warm"],
+                "latency_ms": {"decode": round((decoded_at - began) * 1000),
+                               "stt": round((transcribed_at - decoded_at) * 1000),
+                               "tts": round((finished - transcribed_at) * 1000),
+                               "total": round((finished - began) * 1000)}}
+    finally:
+        source.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+        if not generated.is_file():
+            generated.unlink(missing_ok=True)
 
 
 @app.post("/api/stt")
@@ -938,7 +1242,7 @@ async def transcribe(file: UploadFile = File(...), language: str = Form("auto"))
     audio = UPLOADS / f"{output_id}.wav"
     try:
         await asyncio.to_thread(_run, "ffmpeg", "-y", "-v", "error", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(audio))
-        rows, detected = await asyncio.to_thread(_transcribe, audio, language)
+        rows, detected, _ = await asyncio.to_thread(_transcribe, audio, language)
         transcript = "\n".join(row["text"] for row in rows)
         (OUTPUTS / f"{output_id}.txt").write_text(transcript, encoding="utf-8")
         srt = "\n\n".join(f"{i}\n{_srt_time(row['start'])} --> {_srt_time(row['end'])}\n{row['text']}" for i, row in enumerate(rows, 1))

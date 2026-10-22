@@ -85,8 +85,8 @@ def inspect_wav(path: Path) -> dict:
         if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getframerate() != 24000:
             raise ValueError("Bản ghi cần WAV mono 24 kHz, PCM 16-bit")
         duration = wav.getnframes() / wav.getframerate()
-        if not 2.0 <= duration <= 20.0:
-            raise ValueError("Mỗi câu cần 2–20 giây; hãy đọc lại ở tốc độ tự nhiên")
+        if not 3.0 <= duration <= 15.0:
+            raise ValueError("Mỗi câu cần 3–15 giây theo recipe VieNeu hiện tại; hãy đọc lại ở tốc độ tự nhiên")
         samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768
     rms = float(np.sqrt(np.mean(samples * samples)))
     clipping = float(np.mean(np.abs(samples) >= .98))
