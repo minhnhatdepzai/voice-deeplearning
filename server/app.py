@@ -35,7 +35,9 @@ from server.text_normalization import normalize_for_speech
 from server.target_voice import process as extract_target_voice
 from server.dominant_speaker import analyze as find_dominant_speaker
 from server.realtime_voice import WarmVoiceWorker
-from server.speech_to_speech import postprocess_filter, recognition_profile, synthesis_profile, validate_utterance
+from server.speech_to_speech import (MAX_SPEECH_TO_SPEECH_BYTES, postprocess_filter,
+                                     recognition_profile, split_synthesis_text,
+                                     synthesis_profile, validate_utterance)
 from training import self_recording
 from training import uploaded_audio
 
@@ -1131,13 +1133,26 @@ def _prepare_warm_voice(voice: dict) -> dict:
 def _synthesize_interactive(voice: dict, text: str, output: Path, locale: str,
                             tts_profile: str = "stable", denoise: str = "light") -> dict:
     normalized = normalize_for_speech(text, locale)
+    chunks = split_synthesis_text(normalized)
+    if not chunks:
+        raise HTTPException(422, "Không có nội dung hợp lệ để tạo giọng.")
     config = _warm_voice_config(voice)
+    partials: list[Path] = []
+    concat_list = output.with_name(output.stem + ".concat.txt")
     with _tts_lock, _gpu_slot(wait_seconds=300, min_free_mib=4000):
         try:
-            result = _warm_voice.synthesize(
-                normalized, output, mode=config["mode"], model=config.get("model"),
-                voice=config.get("voice"), reference=config.get("reference"), sampling=synthesis_profile(tts_profile),
-            )
+            results = []
+            for index, chunk in enumerate(chunks):
+                partial = output if len(chunks) == 1 else output.with_name(f"{output.stem}.part-{index:04d}.wav")
+                partials.append(partial)
+                results.append(_warm_voice.synthesize(
+                    chunk, partial, mode=config["mode"], model=config.get("model"),
+                    voice=config.get("voice"), reference=config.get("reference"), sampling=synthesis_profile(tts_profile),
+                ))
+            if len(partials) > 1:
+                concat_list.write_text("".join(f"file '{part.resolve().as_posix()}'\n" for part in partials), encoding="utf-8")
+                _run("ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                     "-i", str(concat_list), "-c:a", "pcm_s16le", str(output))
             audio_filter = postprocess_filter(denoise)
             if audio_filter:
                 cleaned = output.with_name(output.stem + ".clean.wav")
@@ -1147,10 +1162,15 @@ def _synthesize_interactive(voice: dict, text: str, output: Path, locale: str,
                     cleaned.replace(output)
                 finally:
                     cleaned.unlink(missing_ok=True)
-            return result
+            return {**results[0], "chunks": len(chunks)}
         except Exception as exc:
             output.unlink(missing_ok=True)
             raise HTTPException(500, f"Tạo giọng tương tác thất bại: {exc}") from exc
+        finally:
+            concat_list.unlink(missing_ok=True)
+            for partial in partials:
+                if partial != output:
+                    partial.unlink(missing_ok=True)
 
 
 @app.post("/api/speech-to-speech/warmup")
@@ -1187,7 +1207,7 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     voice = _get_voice(voice_id)
-    source = await _save_upload(file, max_bytes=25 * 1024 * 1024)
+    source = await _save_upload(file, max_bytes=MAX_SPEECH_TO_SPEECH_BYTES)
     output_id = uuid.uuid4().hex
     audio = UPLOADS / f"{output_id}.wav"
     generated = OUTPUTS / f"{output_id}.wav"
@@ -1219,6 +1239,7 @@ async def speech_to_speech(file: UploadFile = File(...), voice_id: str = Form(..
         return {"text": transcript, "language": detected, "voice_id": voice_id,
                 "voice_name": voice["name"], "audio_url": f"/api/media/outputs/{generated.name}",
                 "input_seconds": round(duration, 2), "stt_model": profile.model,
+                "synthesis_chunks": result["chunks"],
                 "tts_profile": tts_profile, "denoise": denoise,
                 "stt_device": _stt_device, "stt_was_warm": stt_warm,
                 "tts_was_warm": result["warm"],

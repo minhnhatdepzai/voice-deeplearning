@@ -1,7 +1,11 @@
 """Shared validation and measurement helpers for interactive speech conversion."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+
+MAX_SPEECH_TO_SPEECH_BYTES = 500 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -62,8 +66,35 @@ def postprocess_filter(name: str) -> str | None:
 
 def validate_utterance(duration: float, size: int) -> None:
     if duration < 0.25:
-        raise ValueError("Câu nói quá ngắn; hãy nói ít nhất khoảng nửa giây.")
-    if duration > 20:
-        raise ValueError("Mỗi lượt nói tối đa 20 giây để giữ phản hồi nhanh.")
-    if size > 25 * 1024 * 1024:
-        raise ValueError("Bản ghi một lượt vượt quá 25 MB.")
+        raise ValueError("Bản ghi quá ngắn; hãy nói ít nhất khoảng nửa giây.")
+    if size > MAX_SPEECH_TO_SPEECH_BYTES:
+        raise ValueError("Bản ghi vượt quá giới hạn tải lên 500 MB.")
+
+
+def split_synthesis_text(text: str, max_chars: int = 240) -> list[str]:
+    """Split long transcripts into TTS-safe chunks without dropping words."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    sentences = re.split(r"(?<=[.!?…])\s+", normalized)
+    pieces: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars:
+            pieces.append(sentence)
+            continue
+        words = sentence.split()
+        current: list[str] = []
+        for word in words:
+            if current and len(" ".join((*current, word))) > max_chars:
+                pieces.append(" ".join(current))
+                current = []
+            current.append(word)
+        if current:
+            pieces.append(" ".join(current))
+    chunks: list[str] = []
+    for piece in pieces:
+        if chunks and len(chunks[-1]) + 1 + len(piece) <= max_chars:
+            chunks[-1] += " " + piece
+        else:
+            chunks.append(piece)
+    return chunks

@@ -1,28 +1,24 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { AudioLines, Gauge, Mic2, Pause, Play, Radio, Zap } from 'lucide-react'
-
-function encodeWav(chunks, sampleRate) {
-  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-  const buffer = new ArrayBuffer(44 + length * 2)
-  const view = new DataView(buffer)
-  const write = (offset, value) => [...value].forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)))
-  write(0, 'RIFF'); view.setUint32(4, 36 + length * 2, true); write(8, 'WAVE')
-  write(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true)
-  write(36, 'data'); view.setUint32(40, length * 2, true)
-  let offset = 44
-  for (const chunk of chunks) for (const sample of chunk) {
-    const clipped = Math.max(-1, Math.min(1, sample))
-    view.setInt16(offset, clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff, true)
-    offset += 2
-  }
-  return new Blob([buffer], { type: 'audio/wav' })
-}
+import { AudioLines, Gauge, Mic2, Play, Radio, Square, Zap } from 'lucide-react'
 
 const phaseLabels = {
-  idle: 'Chưa bật micro', warming: 'Đang nạp model một lần', listening: 'Đang nghe',
-  speaking: 'Đang thu câu nói', processing: 'Đang nhận dạng và đổi giọng', playing: 'Đang phát giọng mới',
+  idle: 'Sẵn sàng thu', warming: 'Đang nạp model một lần', recording: 'Đang thu liên tục',
+  processing: 'Đang nhận dạng và đổi giọng', playing: 'Đang phát giọng mới',
+}
+
+function recorderOptions() {
+  if (!window.MediaRecorder) throw new Error('Trình duyệt này chưa hỗ trợ ghi âm MediaRecorder.')
+  const candidates = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm']
+  const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type))
+  return mimeType ? { mimeType, audioBitsPerSecond: 64000 } : { audioBitsPerSecond: 64000 }
+}
+
+function formatDuration(value) {
+  const total = Math.max(0, Math.floor(Number(value) || 0))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}` : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
 export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
@@ -34,6 +30,7 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
   const [denoise, setDenoise] = useState('light')
   const [phase, setPhase] = useState('idle')
   const [level, setLevel] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
   const [history, setHistory] = useState([])
   const [warmup, setWarmup] = useState(null)
   const runtime = useRef({})
@@ -43,17 +40,29 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
     if (!voices.some(voice => voice.id === voiceId)) setVoiceId(personalTrained.find(voice => voice.s2s_recommended)?.id || personalTrained[0]?.id || trained[0]?.id || voices[0]?.id || '')
   }, [voices, voiceId])
 
-  function releaseBrowser() {
+  function releaseCapture() {
     const state = runtime.current
-    state.processor?.disconnect(); state.source?.disconnect(); state.silent?.disconnect()
+    if (state.frame) cancelAnimationFrame(state.frame)
+    state.source?.disconnect(); state.analyser?.disconnect(); state.silent?.disconnect()
     state.stream?.getTracks().forEach(track => track.stop())
     state.context?.close().catch(() => {})
-    state.player?.pause()
-    runtime.current = {}
+    state.stream = null; state.context = null; state.source = null; state.analyser = null; state.silent = null
     setLevel(0)
   }
 
-  async function stop() {
+  function releaseBrowser() {
+    const state = runtime.current
+    if (state.recorder?.state === 'recording') {
+      state.recorder.onstop = null
+      state.recorder.stop()
+    }
+    releaseCapture()
+    state.player?.pause()
+    runtime.current = {}
+    setElapsed(0)
+  }
+
+  async function cancel() {
     runId.current += 1
     releaseBrowser()
     setPhase('idle')
@@ -66,21 +75,24 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
     fetch('/api/speech-to-speech/release', { method: 'POST' }).catch(() => {})
   }, [])
 
-  function resumeListening(id) {
-    if (id !== runId.current || !runtime.current.context) return
-    runtime.current.active = false
-    runtime.current.utterance = []
-    runtime.current.preRoll = []
-    runtime.current.speechFrames = 0
-    runtime.current.lastVoiceAt = 0
-    setPhase('listening')
+  function monitorInput(id) {
+    const state = runtime.current
+    if (id !== runId.current || !state.analyser) return
+    const samples = new Float32Array(state.analyser.fftSize)
+    state.analyser.getFloatTimeDomainData(samples)
+    let power = 0
+    for (const sample of samples) power += sample * sample
+    setLevel(Math.min(1, Math.sqrt(power / samples.length) * 12))
+    if (state.startedAt) setElapsed((performance.now() - state.startedAt) / 1000)
+    state.frame = requestAnimationFrame(() => monitorInput(id))
   }
 
-  async function submitUtterance(chunks, sampleRate, id) {
+  async function submitRecording(blob, mimeType, id) {
     try {
-      const blob = encodeWav(chunks, sampleRate)
+      if (blob.size < 512) throw new Error('Bản ghi chưa có đủ âm thanh để xử lý.')
+      const extension = mimeType.includes('ogg') ? 'ogg' : 'webm'
       const form = new FormData()
-      form.append('file', new File([blob], `utterance-${Date.now()}.wav`, { type: 'audio/wav' }))
+      form.append('file', new File([blob], `speech-${Date.now()}.${extension}`, { type: mimeType }))
       form.append('voice_id', voiceId); form.append('language', language); form.append('quality', quality)
       form.append('denoise', denoise)
       const result = await api('/speech-to-speech', { method: 'POST', body: form })
@@ -89,64 +101,24 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
       const player = new Audio(result.audio_url)
       runtime.current.player = player
       setPhase('playing')
-      player.onended = () => resumeListening(id)
-      player.onerror = () => resumeListening(id)
-      await player.play().catch(() => resumeListening(id))
+      const finish = () => { if (id === runId.current) { runtime.current.player = null; setPhase('idle') } }
+      player.onended = finish; player.onerror = finish
+      await player.play().catch(finish)
     } catch (error) {
-      if (id === runId.current) {
-        onError(error.message)
-        resumeListening(id)
-      }
+      if (id === runId.current) { onError(error.message); setPhase('idle') }
     }
   }
 
-  function finishUtterance(id) {
+  function stopAndListen() {
     const state = runtime.current
-    if (!state.active || !state.utterance?.length || id !== runId.current) return
-    const chunks = state.utterance
-    state.active = false; state.utterance = []; state.preRoll = []
+    if (phase !== 'recording' || state.recorder?.state !== 'recording') return
     setPhase('processing')
-    submitUtterance(chunks, state.context.sampleRate, id)
-  }
-
-  function handleAudio(event, id) {
-    const state = runtime.current
-    if (!state.context || id !== runId.current || !['listening', 'speaking'].includes(state.phase)) return
-    const chunk = new Float32Array(event.inputBuffer.getChannelData(0))
-    let power = 0
-    for (const sample of chunk) power += sample * sample
-    const rms = Math.sqrt(power / chunk.length)
-    if (!state.lastLevelAt || performance.now() - state.lastLevelAt > 70) {
-      state.lastLevelAt = performance.now(); setLevel(Math.min(1, rms * 12))
-    }
-    if (!state.active) {
-      // Only learn from quiet frames. If the user speaks immediately after
-      // enabling the mic, their voice must not become the ambient baseline.
-      if (rms < Math.max(0.018, state.noise * 2.5)) state.noise = state.noise * 0.98 + rms * 0.02
-      state.preRoll.push(chunk)
-      state.preRollSamples += chunk.length
-      while (state.preRollSamples > state.context.sampleRate * 0.35 && state.preRoll.length > 1) {
-        state.preRollSamples -= state.preRoll[0].length; state.preRoll.shift()
-      }
-    }
-    const threshold = Math.max(0.012, (state.noise || 0.004) * 2.7)
-    if (rms > threshold) state.speechFrames += 1
-    else state.speechFrames = Math.max(0, state.speechFrames - 1)
-    const now = performance.now()
-    if (!state.active && state.speechFrames >= 2) {
-      state.active = true; state.startedAt = now; state.lastVoiceAt = now
-      state.utterance = [...state.preRoll]; state.preRoll = []; state.preRollSamples = 0
-      state.phase = 'speaking'; setPhase('speaking')
-    } else if (state.active) {
-      state.utterance.push(chunk)
-      if (rms > threshold) state.lastVoiceAt = now
-      if ((now - state.lastVoiceAt > 680 && now - state.startedAt > 350) || now - state.startedAt > 15000) finishUtterance(id)
-    }
+    state.recorder.stop()
   }
 
   async function start() {
     if (!voiceId) return onError('Hãy chọn một giọng đã train trước.')
-    onError(''); onNotice('')
+    onError(''); onNotice(''); setElapsed(0)
     const id = ++runId.current
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: {
@@ -155,46 +127,73 @@ export default function SpeechToSpeech({ api, voices, onError, onNotice }) {
       const context = new AudioContext({ latencyHint: 'interactive' })
       await context.resume()
       const source = context.createMediaStreamSource(stream)
-      const processor = context.createScriptProcessor(2048, 1, 1)
+      const analyser = context.createAnalyser(); analyser.fftSize = 2048
       const silent = context.createGain(); silent.gain.value = 0
-      runtime.current = { stream, context, source, processor, silent, phase: 'warming', active: false,
-        utterance: [], preRoll: [], preRollSamples: 0, speechFrames: 0, noise: 0.003 }
-      source.connect(processor); processor.connect(silent); silent.connect(context.destination)
-      processor.onaudioprocess = event => handleAudio(event, id)
+      source.connect(analyser); analyser.connect(silent); silent.connect(context.destination)
+      const recorder = new MediaRecorder(stream, recorderOptions())
+      const chunks = []
+      runtime.current = { stream, context, source, analyser, silent, recorder, chunks, startedAt: 0, frame: 0 }
+      recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data) }
+      recorder.onerror = event => { if (id === runId.current) { onError(event.error?.message || 'Không thể tiếp tục ghi âm.'); cancel() } }
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || 'audio/webm'
+        const blob = new Blob(chunks, { type: mimeType })
+        runtime.current.chunks = []
+        runtime.current.recorder = null
+        releaseCapture()
+        if (id === runId.current) submitRecording(blob, mimeType, id)
+      }
       setPhase('warming')
       const state = await api('/speech-to-speech/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ voice_id: voiceId, quality, language }) })
       if (id !== runId.current) return
       setWarmup(state)
-      runtime.current.phase = 'listening'; setPhase('listening')
-      onNotice(`Model đã sẵn sàng sau ${(state.warmup_ms / 1000).toFixed(1)} giây. Hãy nói tự nhiên rồi ngừng khoảng 0,7 giây.`)
+      runtime.current.startedAt = performance.now()
+      recorder.start(1000)
+      setPhase('recording')
+      monitorInput(id)
+      onNotice('Đang thu liên tục. Bạn có thể nói và nghỉ tùy ý; khi hoàn tất hãy bấm “Dừng & nghe”.')
     } catch (error) {
       if (id === runId.current) { releaseBrowser(); setPhase('idle'); onError(error.message) }
     }
   }
 
-  useEffect(() => { if (runtime.current.context) runtime.current.phase = phase }, [phase])
+  function stopPlayback() {
+    runtime.current.player?.pause()
+    runtime.current.player = null
+    setPhase('idle')
+  }
+
   const active = phase !== 'idle'
+  const button = phase === 'idle'
+    ? { action: start, disabled: !voiceId, icon: <Mic2 size={18}/>, text: 'Bắt đầu thu' }
+    : phase === 'recording'
+      ? { action: stopAndListen, disabled: false, icon: <Square size={17}/>, text: 'Dừng & nghe' }
+      : phase === 'warming'
+        ? { action: cancel, disabled: false, icon: <Square size={17}/>, text: 'Hủy' }
+        : phase === 'playing'
+          ? { action: stopPlayback, disabled: false, icon: <Square size={17}/>, text: 'Dừng phát' }
+          : { action: () => {}, disabled: true, icon: <Zap size={18}/>, text: 'Đang xử lý bản ghi' }
 
   return <>
-    <div className="page-heading compact"><div><div className="eyebrow"><span/> SPEECH TO SPEECH · TỰ ĐỘNG</div><h1>Bạn nói. AI trả lại <em>đúng giọng đã train.</em></h1><p>Micro tự nhận biết khi bạn nói xong, phiên âm câu nói rồi phát ngay bằng giọng đã chọn.</p></div></div>
+    <div className="page-heading compact"><div><div className="eyebrow"><span/> SPEECH TO SPEECH · THU THỦ CÔNG</div><h1>Nói đầy đủ. Bấm dừng. <em>AI mới bắt đầu đổi giọng.</em></h1><p>Không tự ngắt khi bạn im lặng và không giới hạn số giây mỗi lượt. Toàn bộ bản ghi chỉ được xử lý sau khi bạn bấm Dừng & nghe.</p></div></div>
     <div className="s2s-grid">
       <section className="panel s2s-control">
-        <div className="panel-title"><span className="panel-icon purple"><Radio size={20}/></span><div><h3>Phiên đổi giọng trực tiếp</h3><p>Model được giữ nóng trong suốt phiên</p></div></div>
+        <div className="panel-title"><span className="panel-icon purple"><Radio size={20}/></span><div><h3>Thu và đổi giọng toàn đoạn</h3><p>Model được giữ nóng để lần tiếp theo nhanh hơn</p></div></div>
         <label className="field-label" htmlFor="s2s-voice">Giọng đầu ra</label>
         <div className="select-wrap"><select id="s2s-voice" value={voiceId} disabled={active} onChange={event => setVoiceId(event.target.value)}>
           {voices.map(voice => <option value={voice.id} key={voice.id}>{voice.name} · {voice.kind === 'finetuned' ? 'đã train' : 'mẫu tham chiếu'}</option>)}
         </select></div>
         <div className="s2s-options"><label><span>Ngôn ngữ nói</span><select value={language} disabled={active} onChange={event => setLanguage(event.target.value)}><option value="vi">Tiếng Việt</option><option value="en">English</option><option value="auto">Tự nhận diện</option></select></label><label><span>Độ chính xác</span><select value={quality} disabled={active} onChange={event => setQuality(event.target.value)}><option value="fast">Nhanh · Whisper small beam 1</option><option value="balanced">Cân bằng · Whisper turbo beam 3</option><option value="accurate">Chuẩn hơn · Whisper turbo beam 5</option></select></label><label><span>Lọc tiếng ù đầu ra</span><select value={denoise} disabled={active} onChange={event => setDenoise(event.target.value)}><option value="light">Nhẹ · giữ tự nhiên</option><option value="strong">Mạnh · ít nền hơn</option><option value="off">Tắt lọc</option></select></label></div>
-        <div className={`s2s-orb ${phase}`}><div className="s2s-level" style={{ transform: `scale(${1 + level * .32})` }}/>{phase === 'speaking' ? <AudioLines size={46}/> : phase === 'processing' || phase === 'warming' ? <Zap size={44}/> : <Mic2 size={46}/>}</div>
-        <div className="s2s-state"><span className={`state-dot ${active ? 'live' : ''}`}/><strong>{phaseLabels[phase]}</strong>{phase === 'listening' && <small>Nói một câu; hệ thống tự chốt sau 0,7 giây im lặng</small>}{phase === 'speaking' && <small>Đang thu · tối đa 15 giây mỗi lượt</small>}</div>
-        <button type="button" className={`button full ${active ? 'outline danger' : 'primary'}`} onClick={active ? stop : start} disabled={!voiceId}>{active ? <Pause size={18}/> : <Mic2 size={18}/>} {active ? 'Dừng phiên và giải phóng model' : 'Bật micro và nạp model'}</button>
-        <p className="fine-print">Đeo tai nghe để tránh micro thu lại tiếng vừa phát. Lượt đầu dùng để nạp model; các lượt sau dùng cùng model trong VRAM nên nhanh hơn.</p>
+        <div className={`s2s-orb ${phase}`}><div className="s2s-level" style={{ transform: `scale(${1 + level * .32})` }}/>{phase === 'recording' ? <AudioLines size={46}/> : phase === 'processing' || phase === 'warming' ? <Zap size={44}/> : <Mic2 size={46}/>}</div>
+        <div className="s2s-state"><span className={`state-dot ${active ? 'live' : ''}`}/><strong>{phaseLabels[phase]}</strong>{phase === 'recording' && <small>Đã thu {formatDuration(elapsed)} · chỉ xử lý khi bấm Dừng & nghe</small>}{phase === 'processing' && <small>File dài sẽ được chia nhỏ khi tạo giọng rồi ghép lại thành một bản</small>}</div>
+        <button type="button" className={`button full ${active ? 'outline danger' : 'primary'}`} onClick={button.action} disabled={button.disabled}>{button.icon} {button.text}</button>
+        <p className="fine-print">Không có bộ đếm tự dừng. Giới hạn thực tế phụ thuộc bộ nhớ trình duyệt và dung lượng tải lên tối đa 500 MB. Đeo tai nghe để tránh micro thu lại âm thanh từ loa.</p>
       </section>
       <section className="panel s2s-history">
-        <div className="panel-title"><span className="panel-icon blue"><Gauge size={20}/></span><div><h3>Câu vừa chuyển</h3><p>Phiên âm, file giọng mới và thời gian xử lý thật</p></div></div>
+        <div className="panel-title"><span className="panel-icon blue"><Gauge size={20}/></span><div><h3>Bản ghi vừa chuyển</h3><p>Phiên âm, file giọng mới và thời gian xử lý thật</p></div></div>
         {warmup && <div className="s2s-warm"><Zap size={16}/><span>{warmup.stt_model} · {warmup.stt_device}</span><strong>Nạp {(warmup.warmup_ms / 1000).toFixed(1)}s</strong></div>}
-        {history.length ? <div className="s2s-results">{history.map(item => <article key={item.id}><div><time>{item.at}</time><span>{item.language.toUpperCase()} · câu vào {item.input_seconds}s</span></div><p>{item.text}</p><div className="s2s-metrics"><span>STT {(item.latency_ms.stt / 1000).toFixed(2)}s</span><span>TTS {(item.latency_ms.tts / 1000).toFixed(2)}s</span><strong>Tổng {(item.latency_ms.total / 1000).toFixed(2)}s</strong><button type="button" onClick={() => new Audio(item.audio_url).play()}><Play size={14}/> Nghe lại</button></div></article>)}</div> : <div className="empty-result"><div className="empty-orbit"><AudioLines size={40}/></div><h3>Chưa có câu nào</h3><p>Bật micro, chờ model sẵn sàng rồi nói một câu ngắn.</p></div>}
+        {history.length ? <div className="s2s-results">{history.map(item => <article key={item.id}><div><time>{item.at}</time><span>{item.language.toUpperCase()} · bản ghi {formatDuration(item.input_seconds)} · {item.synthesis_chunks || 1} đoạn tạo giọng</span></div><p>{item.text}</p><div className="s2s-metrics"><span>STT {(item.latency_ms.stt / 1000).toFixed(2)}s</span><span>TTS {(item.latency_ms.tts / 1000).toFixed(2)}s</span><strong>Tổng {(item.latency_ms.total / 1000).toFixed(2)}s</strong><button type="button" onClick={() => new Audio(item.audio_url).play()}><Play size={14}/> Nghe lại</button></div></article>)}</div> : <div className="empty-result"><div className="empty-orbit"><AudioLines size={40}/></div><h3>Chưa có bản ghi nào</h3><p>Bấm Bắt đầu thu, nói đầy đủ rồi bấm Dừng & nghe.</p></div>}
       </section>
     </div>
   </>
